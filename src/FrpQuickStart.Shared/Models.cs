@@ -32,6 +32,15 @@ public sealed class HealthResponse
     public int FrpsBindPort { get; set; }
     public int ControlPort { get; set; }
     public bool FrpsStartedByServer { get; set; }
+    /// <summary>
+    /// TLS 加密模式: "none" / "self-signed" / "acme"
+    /// </summary>
+    public string TlsMode { get; set; } = "none";
+    /// <summary>
+    /// 自签证书的 SHA256 指纹，供客户端验证。
+    /// 仅在 TlsMode 为 "self-signed" 时有值。
+    /// </summary>
+    public string TlsFingerprint { get; set; } = "";
 }
 
 [JsonSerializable(typeof(TunnelRequest))]

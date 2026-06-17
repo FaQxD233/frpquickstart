@@ -1,7 +1,10 @@
 using System.Diagnostics;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using FrpQuickStart.Server;
@@ -20,7 +23,6 @@ Directory.CreateDirectory(runtimeDir);
 
 Console.WriteLine("FRP QuickStart Ubuntu Server");
 Console.WriteLine($"配置文件: {Path.GetFullPath(configPath)}");
-Console.WriteLine($"控制服务: http://{settings.ControlBindAddress}:{settings.ControlPort}/");
 Console.WriteLine($"frps 端口: {settings.FrpsBindPort}");
 
 // ROB-6: 仅在首次生成密钥时明文显示，后续启动提示从配置文件查看
@@ -43,7 +45,102 @@ else
 }
 
 Console.WriteLine();
-Console.WriteLine("安全提示: 控制平面使用明文 HTTP，请确保仅在受信网络/内网中使用，或通过 SSH 隧道等加密通道访问。");
+
+// TLS 模式选择
+var tlsMode = GetOption(args, "--tls")?.Trim().ToLowerInvariant();
+if (tlsMode is null && string.Equals(settings.TlsMode, "none", StringComparison.OrdinalIgnoreCase))
+{
+    Console.WriteLine("是否启用 TLS 加密?");
+    Console.WriteLine("  none        - 不加密 (默认，仅限受信网络)");
+    Console.WriteLine("  self-signed - 自动生成自签证书");
+    Console.WriteLine("  acme        - 使用 acme.sh 获取的 Let's Encrypt IP 证书");
+    Console.Write("请选择 [none/self-signed/acme]: ");
+    var input = Console.ReadLine()?.Trim().ToLowerInvariant();
+    tlsMode = input switch
+    {
+        "self-signed" or "1" => "self-signed",
+        "acme" or "2" => "acme",
+        _ => "none"
+    };
+}
+else if (tlsMode is null)
+{
+    tlsMode = settings.TlsMode;
+}
+
+if (tlsMode is not "none" and not "self-signed" and not "acme")
+{
+    Console.Error.WriteLine($"未知 TLS 模式: {tlsMode}，请使用 none/self-signed/acme。");
+    return;
+}
+
+X509Certificate2? serverCert = null;
+string? tlsFingerprint = null;
+
+if (tlsMode == "self-signed")
+{
+    var certPath = Path.Combine(runtimeDir, "server-cert.pfx");
+    if (File.Exists(certPath))
+    {
+        serverCert = X509CertificateLoader.LoadPkcs12FromFile(certPath, null);
+        Console.WriteLine($"TLS: 加载已有自签证书 {certPath}");
+    }
+    else
+    {
+        serverCert = GenerateSelfSignedCert(settings, certPath);
+        Console.WriteLine($"TLS: 已生成自签证书并保存到 {certPath}");
+    }
+    tlsFingerprint = serverCert.GetCertHashString(HashAlgorithmName.SHA256);
+    Console.WriteLine($"TLS 证书指纹 (SHA256): {tlsFingerprint}");
+    Console.WriteLine("请将此指纹告知 Windows 客户端用户，客户端需要该指纹验证证书。");
+}
+else if (tlsMode == "acme")
+{
+    var certPath = GetOption(args, "--tls-cert") ?? settings.TlsCertPath;
+    var keyPath = GetOption(args, "--tls-key") ?? settings.TlsKeyPath;
+
+    if (string.IsNullOrWhiteSpace(certPath) || string.IsNullOrWhiteSpace(keyPath))
+    {
+        Console.Error.WriteLine("acme 模式需要指定证书和私钥路径。使用 --tls-cert 和 --tls-key 参数，或在 server-config.json 中设置 TlsCertPath 和 TlsKeyPath。");
+        return;
+    }
+
+    if (!File.Exists(certPath))
+    {
+        Console.Error.WriteLine($"TLS 证书文件不存在: {certPath}");
+        return;
+    }
+    if (!File.Exists(keyPath))
+    {
+        Console.Error.WriteLine($"TLS 私钥文件不存在: {keyPath}");
+        return;
+    }
+
+    serverCert = X509Certificate2.CreateFromPemFile(certPath, keyPath);
+    Console.WriteLine($"TLS: 加载 acme 证书 {certPath}");
+
+    if (serverCert.NotAfter < DateTimeOffset.UtcNow)
+    {
+        Console.Error.WriteLine($"[警告] TLS 证书已过期 ({serverCert.NotAfter:u})，请重新获取。");
+    }
+    else if (serverCert.NotAfter < DateTimeOffset.UtcNow.AddDays(1))
+    {
+        Console.WriteLine($"[警告] TLS 证书即将过期 ({serverCert.NotAfter:u})，请及时续期。");
+    }
+    Console.WriteLine("acme 证书由公共 CA 签发，客户端无需额外配置即可信任。");
+}
+
+var protocolPrefix = tlsMode == "none" ? "http" : "https";
+Console.WriteLine($"控制服务: {protocolPrefix}://{settings.ControlBindAddress}:{settings.ControlPort}/");
+
+if (tlsMode == "none")
+{
+    Console.WriteLine("安全提示: 控制平面使用明文 HTTP，请确保仅在受信网络/内网中使用，或通过 SSH 隧道等加密通道访问。");
+}
+else
+{
+    Console.WriteLine($"安全: 控制平面已启用 TLS ({tlsMode})。");
+}
 Console.WriteLine();
 
 Process? frpsProcess = null;
@@ -114,7 +211,7 @@ while (!frpsMonitorCts.Token.IsCancellationRequested)
         break;
     }
 
-    _ = Task.Run(() => HandleClientAsync(client, settings, runtimeDir, frpsProcess is not null, allocatedPorts, allocatedPortsLock, concurrencySemaphore, frpsMonitorCts.Token));
+    _ = Task.Run(() => HandleClientAsync(client, settings, runtimeDir, frpsProcess is not null, allocatedPorts, allocatedPortsLock, concurrencySemaphore, frpsMonitorCts.Token, serverCert, tlsMode, tlsFingerprint));
 }
 
 StopChild(frpsProcess);
@@ -167,6 +264,71 @@ static Process? EnsureFrps(ServerSettings settings, string runtimeDir)
     return process;
 }
 
+static X509Certificate2 GenerateSelfSignedCert(ServerSettings settings, string savePath)
+{
+    using var rsa = RSA.Create(2048);
+
+    var subject = new X500DistinguishedName($"CN=FrpQuickStart-{Environment.MachineName}");
+    var request = new CertificateRequest(subject, rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+    // Basic Constraints: not a CA
+    request.CertificateExtensions.Add(
+        new X509BasicConstraintsExtension(certificateAuthority: false, hasPathLengthConstraint: false, pathLengthConstraint: 0, critical: true));
+
+    // Key Usage: Digital Signature + Key Encipherment
+    request.CertificateExtensions.Add(
+        new X509KeyUsageExtension(
+            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
+            critical: true));
+
+    // Extended Key Usage: Server Authentication
+    request.CertificateExtensions.Add(
+        new X509EnhancedKeyUsageExtension(
+            new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, // serverAuth
+            critical: true));
+
+    // Subject Alternative Name: include server's public IP if known
+    var sanBuilder = new SubjectAlternativeNameBuilder();
+    if (!string.IsNullOrWhiteSpace(settings.PublicAddress))
+    {
+        if (IPAddress.TryParse(settings.PublicAddress, out var ip))
+        {
+            sanBuilder.AddIpAddress(ip);
+        }
+        else
+        {
+            sanBuilder.AddDnsName(settings.PublicAddress);
+        }
+    }
+    sanBuilder.AddIpAddress(IPAddress.Loopback); // always include 127.0.0.1 for testing
+    request.CertificateExtensions.Add(sanBuilder.Build());
+
+    // Subject Key Identifier
+    request.CertificateExtensions.Add(
+        new X509SubjectKeyIdentifierExtension(request.PublicKey, critical: false));
+
+    var cert = request.CreateSelfSigned(
+        DateTimeOffset.Now.AddDays(-1),
+        DateTimeOffset.Now.AddYears(5));
+
+    // Save as PFX (no password for simplicity)
+    var pfxBytes = cert.Export(X509ContentType.Pfx);
+    File.WriteAllBytes(savePath, pfxBytes);
+
+    // Set Unix file permissions (owner read/write only)
+    if (!OperatingSystem.IsWindows())
+    {
+        File.SetUnixFileMode(savePath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+    }
+
+    // Also save PEM for inspection
+    var pemPath = Path.ChangeExtension(savePath, ".pem");
+    File.WriteAllText(pemPath, cert.ExportCertificatePem());
+
+    // Return a new instance with the private key available
+    return new X509Certificate2(pfxBytes);
+}
+
 // ROB-3: frps 进程监控，退出时打印警告
 static async Task MonitorFrpsAsync(Process frpsProcess, CancellationToken ct)
 {
@@ -185,7 +347,7 @@ static async Task MonitorFrpsAsync(Process frpsProcess, CancellationToken ct)
     }
 }
 
-static async Task HandleClientAsync(TcpClient client, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock, SemaphoreSlim concurrencySemaphore, CancellationToken ct)
+static async Task HandleClientAsync(TcpClient client, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock, SemaphoreSlim concurrencySemaphore, CancellationToken ct, X509Certificate2? serverCert, string tlsMode, string? tlsFingerprint)
 {
     if (!await concurrencySemaphore.WaitAsync(5000, ct))
     {
@@ -194,7 +356,13 @@ static async Task HandleClientAsync(TcpClient client, ServerSettings settings, s
         {
             try
             {
-                var stream = client.GetStream();
+                Stream stream = client.GetStream();
+                if (serverCert is not null)
+                {
+                    var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+                    await sslStream.AuthenticateAsServerAsync(serverCert, clientCertificateRequired: false, enabledSslProtocols: SslProtocols.Tls13 | SslProtocols.Tls12, checkCertificateRevocation: false);
+                    stream = sslStream;
+                }
                 await WriteErrorAsync(stream, HttpStatusCode.ServiceUnavailable, "服务繁忙，请稍后重试。");
             }
             catch
@@ -211,11 +379,22 @@ static async Task HandleClientAsync(TcpClient client, ServerSettings settings, s
         client.ReceiveTimeout = 30_000;
         client.SendTimeout = 10_000;
 
-        var stream = client.GetStream();
+        Stream stream = client.GetStream();
         try
         {
+            if (serverCert is not null)
+            {
+                var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+                await sslStream.AuthenticateAsServerAsync(serverCert, clientCertificateRequired: false, enabledSslProtocols: SslProtocols.Tls13 | SslProtocols.Tls12, checkCertificateRevocation: false);
+                stream = sslStream;
+            }
+
             var request = await ReadHttpRequestAsync(stream, ct);
-            await HandleRequestAsync(stream, request, settings, runtimeDir, frpsStartedByServer, allocatedPorts, allocatedPortsLock);
+            await HandleRequestAsync(stream, request, settings, runtimeDir, frpsStartedByServer, allocatedPorts, allocatedPortsLock, tlsMode, tlsFingerprint);
+        }
+        catch (AuthenticationException ex)
+        {
+            Console.Error.WriteLine($"[TLS 握手失败] {ex.Message} 客户端可能使用了错误的协议 (HTTP vs HTTPS)。");
         }
         catch (Exception ex)
         {
@@ -237,7 +416,7 @@ static async Task HandleClientAsync(TcpClient client, ServerSettings settings, s
     }
 }
 
-static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest httpRequest, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock)
+static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest httpRequest, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock, string tlsMode, string? tlsFingerprint)
 {
     try
     {
@@ -250,7 +429,9 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
                 PublicAddress = settings.PublicAddress,
                 FrpsBindPort = settings.FrpsBindPort,
                 ControlPort = settings.ControlPort,
-                FrpsStartedByServer = frpsStartedByServer
+                FrpsStartedByServer = frpsStartedByServer,
+                TlsMode = tlsMode,
+                TlsFingerprint = tlsFingerprint ?? ""
             }, FrpQuickJsonContext.Default.HealthResponse);
             return;
         }
@@ -494,7 +675,7 @@ static async Task WriteJsonAsync<T>(Stream stream, HttpStatusCode statusCode, T 
     await stream.WriteAsync(body);
 }
 
-static async Task<SimpleHttpRequest> ReadHttpRequestAsync(NetworkStream stream, CancellationToken ct)
+static async Task<SimpleHttpRequest> ReadHttpRequestAsync(Stream stream, CancellationToken ct)
 {
     var received = new List<byte>(4096);
     var buffer = new byte[4096];
@@ -677,12 +858,23 @@ static void PrintHelp()
 {
     Console.WriteLine("""
     用法:
-      frpquick-server [--config server-config.json]
+      frpquick-server [--config server-config.json] [--tls <mode>]
+
+    选项:
+      --config <path>           配置文件路径，默认 server-config.json
+      --tls <mode>              TLS 模式: none (默认) / self-signed / acme
+      --tls-cert <path>         TLS 证书路径 (acme 模式)
+      --tls-key <path>          TLS 私钥路径 (acme 模式)
 
     首次启动会生成 server-config.json，并打印 API 密钥。
     默认使用内置 frps；如需覆盖，请修改 server-config.json 的 FrpsPath。
 
-    安全提示: 控制平面使用明文 HTTP，请仅在受信网络中使用。
+    TLS 模式:
+      none        - 明文 HTTP，仅限受信网络/内网使用
+      self-signed - 自动生成自签证书，打印指纹供客户端验证
+      acme        - 使用 acme.sh 获取的 Let's Encrypt IP 证书 (公网信任)
+
+    安全提示: 使用 TLS 加密可防止密钥和 FrpAuthToken 被中间人窃取。
     """);
 }
 

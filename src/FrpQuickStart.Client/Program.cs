@@ -1,5 +1,8 @@
 using System.Diagnostics;
 using System.Net.Http.Json;
+using System.Net.Security;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using FrpQuickStart.Shared;
@@ -31,7 +34,22 @@ if (protocol is not "tcp" and not "udp")
     return;
 }
 
-var controlUrl = BuildControlUrl(serverHost, controlPort);
+var tlsMode = GetOption(args, "--tls")?.Trim().ToLowerInvariant()
+    ?? PromptWithDefault("TLS 加密模式 [none/self-signed/acme]", "none");
+if (tlsMode is not "none" and not "self-signed" and not "acme")
+{
+    Console.Error.WriteLine($"未知 TLS 模式: {tlsMode}");
+    return;
+}
+
+string? tlsFingerprint = null;
+if (tlsMode == "self-signed")
+{
+    tlsFingerprint = GetOption(args, "--tls-fingerprint")
+        ?? PromptRequired("服务器 TLS 证书指纹 (SHA256，服务端启动时显示)");
+}
+
+var controlUrl = BuildControlUrl(serverHost, controlPort, tlsMode);
 var clientName = Environment.MachineName;
 var request = new TunnelRequest
 {
@@ -46,7 +64,25 @@ var request = new TunnelRequest
 TunnelResponse? response;
 try
 {
-    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+    HttpMessageHandler handler;
+    if (tlsMode == "self-signed" && tlsFingerprint is not null)
+    {
+        var expectedFingerprint = tlsFingerprint.ToUpperInvariant().Replace(":", "").Replace(" ", "");
+        handler = new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = (httpRequestMessage, cert, chain, sslPolicyErrors) =>
+            {
+                if (cert is null) return false;
+                var actualFingerprint = cert.GetCertHashString(HashAlgorithmName.SHA256).ToUpperInvariant();
+                return string.Equals(actualFingerprint, expectedFingerprint, StringComparison.OrdinalIgnoreCase);
+            }
+        };
+    }
+    else
+    {
+        handler = new HttpClientHandler();
+    }
+    using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
     var requestJson = JsonSerializer.Serialize(request, FrpQuickJsonContext.Default.TunnelRequest);
     using var content = new StringContent(requestJson, Encoding.UTF8, "application/json");
     var httpResponse = await http.PostAsync($"{controlUrl}/api/tunnels", content);
@@ -117,7 +153,7 @@ await frpcProcess.WaitForExitAsync();
 Console.WriteLine($"frpc 已退出，退出码: {frpcProcess.ExitCode}");
 Environment.ExitCode = frpcProcess.ExitCode;
 
-static string BuildControlUrl(string hostOrUrl, int port)
+static string BuildControlUrl(string hostOrUrl, int port, string tlsMode)
 {
     if (Uri.TryCreate(hostOrUrl, UriKind.Absolute, out var uri) &&
         (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
@@ -125,7 +161,8 @@ static string BuildControlUrl(string hostOrUrl, int port)
         return uri.ToString().TrimEnd('/');
     }
 
-    return $"http://{hostOrUrl}:{port}";
+    var scheme = tlsMode == "none" ? "http" : "https";
+    return $"{scheme}://{hostOrUrl}:{port}";
 }
 
 static string PromptRequired(string label)
@@ -288,8 +325,17 @@ static void PrintHelp()
       --protocol <tcp|udp>        默认 tcp
       --frpc <路径>               自定义 frpc.exe 路径，默认使用内置 frpc
 
+    TLS 选项:
+      --tls <mode>                TLS 模式: none (默认) / self-signed / acme
+      --tls-fingerprint <SHA256>  自签证书指纹 (self-signed 模式)
+
     不传选项时会逐项询问。
 
-    安全提示: 控制平面使用明文 HTTP，请确保仅在受信网络/内网中使用。
+    TLS 模式说明:
+      none        - 明文 HTTP，仅限受信网络/内网使用
+      self-signed - 使用自签证书，需要服务端启动时显示的 SHA256 指纹
+      acme        - 使用 acme.sh 获取的公网证书，客户端自动信任
+
+    安全提示: 使用 --tls self-signed 或 --tls acme 可加密控制平面通信。
     """);
 }

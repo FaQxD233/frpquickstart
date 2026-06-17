@@ -18,6 +18,23 @@ public sealed class ServerSettings
     public string RuntimeDirectory { get; set; } = "runtime";
 
     /// <summary>
+    /// TLS 加密模式: "none" (明文 HTTP), "self-signed" (自动生成自签证书), "acme" (acme.sh IP 证书)
+    /// </summary>
+    public string TlsMode { get; set; } = "none";
+
+    /// <summary>
+    /// TLS 证书文件路径。
+    /// self-signed 模式: PFX 文件路径（默认自动保存到 runtime/ 目录）。
+    /// acme 模式: PEM 证书文件路径。
+    /// </summary>
+    public string TlsCertPath { get; set; } = "";
+
+    /// <summary>
+    /// TLS 私钥文件路径（仅 acme 模式使用，PEM 格式）。
+    /// </summary>
+    public string TlsKeyPath { get; set; } = "";
+
+    /// <summary>
     /// 标记是否为首次生成（首次启动时为 true，从已有配置文件加载时为 false）。
     /// 用于控制密钥是否明文打印到控制台。
     /// </summary>
@@ -34,7 +51,6 @@ public sealed class ServerSettings
             loaded.EnsureSecrets();
             if (shouldSave)
             {
-                // 补充缺失的密钥时也标记为非首次——已有配置说明不是全新部署
                 Save(path, loaded);
             }
 
@@ -46,7 +62,7 @@ public sealed class ServerSettings
         var settings = new ServerSettings
         {
             ApiSecret = CreateSecret(),
-            FrpAuthToken = CreateSecret(),  // BUG-3: 独立生成，不再回退为 ApiSecret
+            FrpAuthToken = CreateSecret(),
             IsNewlyCreated = true
         };
         Save(path, settings);
@@ -75,6 +91,10 @@ public sealed class ServerSettings
         }
 
         PublicAddress = Environment.GetEnvironmentVariable("FRPQS_PUBLIC_ADDR") ?? PublicAddress;
+
+        TlsMode = Environment.GetEnvironmentVariable("FRPQS_TLS_MODE") ?? TlsMode;
+        TlsCertPath = Environment.GetEnvironmentVariable("FRPQS_TLS_CERT") ?? TlsCertPath;
+        TlsKeyPath = Environment.GetEnvironmentVariable("FRPQS_TLS_KEY") ?? TlsKeyPath;
     }
 
     private void EnsureSecrets()
@@ -84,8 +104,6 @@ public sealed class ServerSettings
             ApiSecret = CreateSecret();
         }
 
-        // BUG-3 FIX: FrpAuthToken 为空时独立生成，不再回退为 ApiSecret
-        // 之前: FrpAuthToken = ApiSecret; 导致两个密钥相同，降低安全性
         if (string.IsNullOrWhiteSpace(FrpAuthToken))
         {
             FrpAuthToken = CreateSecret();
