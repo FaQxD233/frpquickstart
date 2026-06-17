@@ -164,6 +164,7 @@ else
 Console.WriteLine();
 
 Process? frpsProcess = null;
+var frpsProcessLock = new object();
 try
 {
     frpsProcess = EnsureFrps(settings, runtimeDir);
@@ -201,12 +202,43 @@ if (frpsProcess is not null)
     _ = MonitorFrpsAsync(frpsProcess, frpsMonitorCts.Token);
 }
 
+bool IsFrpsManagedByServer()
+{
+    lock (frpsProcessLock)
+    {
+        return frpsProcess is not null;
+    }
+}
+
+bool RestartManagedFrps()
+{
+    lock (frpsProcessLock)
+    {
+        if (frpsProcess is null)
+        {
+            return false;
+        }
+
+        StopChild(frpsProcess);
+        frpsProcess = EnsureFrps(settings, runtimeDir);
+        if (frpsProcess is not null)
+        {
+            _ = MonitorFrpsAsync(frpsProcess, frpsMonitorCts.Token);
+        }
+
+        return frpsProcess is not null;
+    }
+}
+
 Console.CancelKeyPress += (_, eventArgs) =>
 {
     eventArgs.Cancel = true;
     frpsMonitorCts.Cancel();
     StopListener(listener);
-    StopChild(frpsProcess);
+    lock (frpsProcessLock)
+    {
+        StopChild(frpsProcess);
+    }
 };
 
 Console.WriteLine("等待 Windows 客户端请求，按 Ctrl+C 退出。");
@@ -231,10 +263,13 @@ while (!frpsMonitorCts.Token.IsCancellationRequested)
         break;
     }
 
-    _ = Task.Run(() => HandleClientAsync(client, settings, runtimeDir, frpsProcess is not null, allocatedPorts, allocatedPortsLock, concurrencySemaphore, frpsMonitorCts.Token, tlsCertificateProvider, tlsMode, tlsFingerprint));
+    _ = Task.Run(() => HandleClientAsync(client, settings, runtimeDir, IsFrpsManagedByServer, RestartManagedFrps, allocatedPorts, allocatedPortsLock, concurrencySemaphore, frpsMonitorCts.Token, tlsCertificateProvider, tlsMode, tlsFingerprint));
 }
 
-StopChild(frpsProcess);
+lock (frpsProcessLock)
+{
+    StopChild(frpsProcess);
+}
 
 static Process? EnsureFrps(ServerSettings settings, string runtimeDir)
 {
@@ -654,7 +689,7 @@ static async Task MonitorFrpsAsync(Process frpsProcess, CancellationToken ct)
     }
 }
 
-static async Task HandleClientAsync(TcpClient client, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock, SemaphoreSlim concurrencySemaphore, CancellationToken ct, TlsCertificateProvider? tlsCertificateProvider, string tlsMode, string? tlsFingerprint)
+static async Task HandleClientAsync(TcpClient client, ServerSettings settings, string runtimeDir, Func<bool> isFrpsManagedByServer, Func<bool> restartManagedFrps, HashSet<int> allocatedPorts, object allocatedPortsLock, SemaphoreSlim concurrencySemaphore, CancellationToken ct, TlsCertificateProvider? tlsCertificateProvider, string tlsMode, string? tlsFingerprint)
 {
     // SEC-3 FIX: 在 TLS 握手前检查并发限制，避免浪费资源
     if (!await concurrencySemaphore.WaitAsync(5000, ct))
@@ -685,7 +720,7 @@ static async Task HandleClientAsync(TcpClient client, ServerSettings settings, s
             }
 
             var request = await ReadHttpRequestAsync(stream, ct);
-            await HandleRequestAsync(stream, request, settings, runtimeDir, frpsStartedByServer, allocatedPorts, allocatedPortsLock, tlsMode, tlsFingerprint);
+            await HandleRequestAsync(stream, request, settings, runtimeDir, isFrpsManagedByServer, restartManagedFrps, allocatedPorts, allocatedPortsLock, tlsMode, tlsFingerprint);
         }
         catch (AuthenticationException)
         {
@@ -716,7 +751,7 @@ static async Task HandleClientAsync(TcpClient client, ServerSettings settings, s
     }
 }
 
-static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest httpRequest, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock, string tlsMode, string? tlsFingerprint)
+static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest httpRequest, ServerSettings settings, string runtimeDir, Func<bool> isFrpsManagedByServer, Func<bool> restartManagedFrps, HashSet<int> allocatedPorts, object allocatedPortsLock, string tlsMode, string? tlsFingerprint)
 {
     try
     {
@@ -730,7 +765,7 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
                 PublicAddress = settings.PublicAddress,
                 FrpsBindPort = settings.FrpsBindPort,
                 ControlPort = settings.ControlPort,
-                FrpsStartedByServer = frpsStartedByServer,
+                FrpsStartedByServer = isFrpsManagedByServer(),
                 TlsMode = tlsMode,
                 TlsFingerprint = tlsFingerprint ?? ""
             }, FrpQuickJsonContext.Default.HealthResponse);
@@ -776,10 +811,41 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
             return;
         }
 
+        // POST /api/tunnels/release - 释放端口/关闭隧道
+        if (httpRequest.Method == "POST" && httpRequest.Path == "/api/tunnels/release")
+        {
+            if (!IsAdminAuthorized(httpRequest, settings))
+            {
+                await WriteErrorAsync(responseStream, HttpStatusCode.Unauthorized, "未授权。");
+                return;
+            }
+
+            await ReleaseTunnelAsync(responseStream, httpRequest, runtimeDir, allocatedPorts, allocatedPortsLock, isFrpsManagedByServer, restartManagedFrps);
+            return;
+        }
+
+        // POST /api/tunnels/prune-offline - 清理全部离线隧道记录
+        if (httpRequest.Method == "POST" && httpRequest.Path == "/api/tunnels/prune-offline")
+        {
+            if (!IsAdminAuthorized(httpRequest, settings))
+            {
+                await WriteErrorAsync(responseStream, HttpStatusCode.Unauthorized, "未授权。");
+                return;
+            }
+
+            var removed = PruneOfflineTunnelRecords(runtimeDir, allocatedPorts, allocatedPortsLock);
+            await WriteJsonAsync(responseStream, HttpStatusCode.OK, new TunnelResponse
+            {
+                Success = true,
+                Message = $"已清理 {removed} 条离线隧道记录。"
+            }, FrpQuickJsonContext.Default.TunnelResponse);
+            return;
+        }
+
         // POST /api/tunnels - 创建隧道（原有接口）
         if (httpRequest.Method != "POST" || httpRequest.Path != "/api/tunnels")
         {
-            await WriteErrorAsync(responseStream, HttpStatusCode.NotFound, "接口不存在。可用接口: GET /health, GET /admin, GET /api/tunnels/list, GET /api/stats, POST /api/tunnels");
+            await WriteErrorAsync(responseStream, HttpStatusCode.NotFound, "接口不存在。可用接口: GET /health, GET /admin, GET /api/tunnels/list, GET /api/stats, POST /api/tunnels, POST /api/tunnels/release, POST /api/tunnels/prune-offline");
             return;
         }
 
@@ -811,6 +877,11 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
         bool portAllocated;
         lock (allocatedPortsLock)
         {
+            if (allocatedPorts.Contains(request.RemotePort) && !IsRemotePortInUse(request.Protocol, request.RemotePort))
+            {
+                allocatedPorts.Remove(request.RemotePort);
+            }
+
             if (allocatedPorts.Contains(request.RemotePort))
             {
                 portAllocated = false;
@@ -920,6 +991,11 @@ static bool IsRemotePortAvailable(string protocol, int port)
     {
         return false;
     }
+}
+
+static bool IsRemotePortInUse(string protocol, int port)
+{
+    return !IsRemotePortAvailable(protocol, port);
 }
 
 static bool IsTcpPortOpen(IPAddress address, int port, TimeSpan timeout)
@@ -1038,6 +1114,155 @@ static void AppendTunnelRecord(string runtimeDir, TunnelRequest request, string 
     }
 
     File.AppendAllText(recordPath, json + Environment.NewLine, Encoding.UTF8);
+}
+
+static async Task ReleaseTunnelAsync(Stream responseStream, SimpleHttpRequest httpRequest, string runtimeDir, HashSet<int> allocatedPorts, object allocatedPortsLock, Func<bool> isFrpsManagedByServer, Func<bool> restartManagedFrps)
+{
+    TunnelAdminRequest? request;
+    try
+    {
+        request = JsonSerializer.Deserialize(httpRequest.Body, FrpQuickJsonContext.Default.TunnelAdminRequest);
+    }
+    catch (JsonException)
+    {
+        await WriteErrorAsync(responseStream, HttpStatusCode.BadRequest, "请求 JSON 格式无效。");
+        return;
+    }
+
+    if (request is null || !IsPort(request.RemotePort))
+    {
+        await WriteErrorAsync(responseStream, HttpStatusCode.BadRequest, "远程端口无效。");
+        return;
+    }
+
+    request.Protocol = string.IsNullOrWhiteSpace(request.Protocol) ? "tcp" : request.Protocol.Trim().ToLowerInvariant();
+    if (request.Protocol is not "tcp" and not "udp")
+    {
+        await WriteErrorAsync(responseStream, HttpStatusCode.BadRequest, "Protocol 只能是 tcp 或 udp。");
+        return;
+    }
+
+    var online = IsRemotePortInUse(request.Protocol, request.RemotePort);
+    var restartedFrps = false;
+    if (online)
+    {
+        if (!request.Force)
+        {
+            await WriteJsonAsync(responseStream, HttpStatusCode.Conflict, new TunnelResponse
+            {
+                Success = false,
+                Message = $"端口 {request.RemotePort} 当前在线。强制关闭会重启 frps，并断开所有在线隧道。"
+            }, FrpQuickJsonContext.Default.TunnelResponse);
+            return;
+        }
+
+        if (!isFrpsManagedByServer())
+        {
+            await WriteJsonAsync(responseStream, HttpStatusCode.Conflict, new TunnelResponse
+            {
+                Success = false,
+                Message = "当前 frps 不是由 frpquick-server 启动，无法自动重启释放在线端口。请先停止对应客户端或外部 frps。"
+            }, FrpQuickJsonContext.Default.TunnelResponse);
+            return;
+        }
+
+        restartedFrps = restartManagedFrps();
+        if (!restartedFrps)
+        {
+            await WriteErrorAsync(responseStream, HttpStatusCode.InternalServerError, "重启 frps 失败。");
+            return;
+        }
+    }
+
+    int removedRecords = RemoveTunnelRecords(runtimeDir, request.RemotePort, request.Protocol, request.ProxyName);
+    lock (allocatedPortsLock)
+    {
+        allocatedPorts.Remove(request.RemotePort);
+    }
+
+    var message = restartedFrps
+        ? $"已重启 frps 并释放端口 {request.RemotePort}。所有在线隧道都已断开，客户端需要重新连接。"
+        : $"已释放端口 {request.RemotePort}，删除 {removedRecords} 条隧道记录。";
+
+    await WriteJsonAsync(responseStream, HttpStatusCode.OK, new TunnelResponse
+    {
+        Success = true,
+        Message = message
+    }, FrpQuickJsonContext.Default.TunnelResponse);
+}
+
+static int PruneOfflineTunnelRecords(string runtimeDir, HashSet<int> allocatedPorts, object allocatedPortsLock)
+{
+    var removed = RewriteTunnelRecords(runtimeDir, record => IsRemotePortInUse(record.Protocol, record.RemotePort));
+    lock (allocatedPortsLock)
+    {
+        allocatedPorts.RemoveWhere(port =>
+            !IsRemotePortInUse("tcp", port) &&
+            !IsRemotePortInUse("udp", port));
+    }
+
+    return removed;
+}
+
+static int RemoveTunnelRecords(string runtimeDir, int remotePort, string protocol, string proxyName)
+{
+    return RewriteTunnelRecords(runtimeDir, record =>
+    {
+        if (record.RemotePort != remotePort ||
+            !string.Equals(record.Protocol, protocol, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(proxyName) &&
+            !string.Equals(record.ProxyName, proxyName, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    });
+}
+
+static int RewriteTunnelRecords(string runtimeDir, Func<TunnelRecord, bool> keepRecord)
+{
+    var recordPath = Path.Combine(runtimeDir, "tunnels.jsonl");
+    if (!File.Exists(recordPath))
+    {
+        return 0;
+    }
+
+    var keptLines = new List<string>();
+    var removed = 0;
+    foreach (var line in File.ReadLines(recordPath))
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            continue;
+        }
+
+        try
+        {
+            var record = JsonSerializer.Deserialize(line, FrpQuickJsonContext.Default.TunnelRecord);
+            if (record is null || keepRecord(record))
+            {
+                keptLines.Add(line);
+            }
+            else
+            {
+                removed++;
+            }
+        }
+        catch
+        {
+            keptLines.Add(line);
+        }
+    }
+
+    var tempPath = recordPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+    File.WriteAllLines(tempPath, keptLines, Encoding.UTF8);
+    File.Move(tempPath, recordPath, overwrite: true);
+    return removed;
 }
 
 static async Task WriteErrorAsync(Stream stream, HttpStatusCode statusCode, string message)
@@ -1476,8 +1701,8 @@ static async Task ServeTunnelsList(Stream responseStream, string runtimeDir)
                 var record = JsonSerializer.Deserialize(line, FrpQuickJsonContext.Default.TunnelRecord);
                 if (record != null)
                 {
-                    // 检测端口是否在线
-                    record.IsOnline = IsPortListening(record.RemotePort);
+                    // 按协议检测端口是否在线，避免 UDP 隧道被 TCP 监听检测误判。
+                    record.IsOnline = IsRemotePortInUse(record.Protocol, record.RemotePort);
                     tunnels.Add(record);
                 }
             }
@@ -1495,37 +1720,12 @@ static async Task ServeTunnelsList(Stream responseStream, string runtimeDir)
     }, FrpQuickJsonContext.Default.TunnelListResponse);
 }
 
-static bool IsPortListening(int port)
-{
-    try
-    {
-        // 检查端口是否被监听（frps 在监听表示隧道在线）
-        var endpoint = new System.Net.IPEndPoint(System.Net.IPAddress.Any, port);
-        using var socket = new System.Net.Sockets.Socket(endpoint.AddressFamily, System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
-        try
-        {
-            socket.Bind(endpoint);
-            // 可以绑定说明没被占用，隧道离线
-            return false;
-        }
-        catch (System.Net.Sockets.SocketException)
-        {
-            // 绑定失败说明端口被占用，隧道在线
-            return true;
-        }
-    }
-    catch
-    {
-        return false;
-    }
-}
-
 static async Task ServeStats(Stream responseStream, string runtimeDir, HashSet<int> allocatedPorts, object allocatedPortsLock)
 {
     var tunnelsFile = Path.Combine(runtimeDir, "tunnels.jsonl");
     var totalTunnels = 0;
     var uniqueClients = new HashSet<string>();
-    var allPorts = new HashSet<int>();
+    var allTunnels = new List<TunnelRecord>();
 
     if (File.Exists(tunnelsFile))
     {
@@ -1542,7 +1742,7 @@ static async Task ServeStats(Stream responseStream, string runtimeDir, HashSet<i
                     {
                         uniqueClients.Add(record.ClientName);
                     }
-                    allPorts.Add(record.RemotePort);
+                    allTunnels.Add(record);
                 }
             }
             catch { /* 跳过 */ }
@@ -1550,7 +1750,12 @@ static async Task ServeStats(Stream responseStream, string runtimeDir, HashSet<i
     }
 
     // 实时检测哪些端口真正在线
-    var actuallyOccupied = allPorts.Where(IsPortListening).ToArray();
+    var actuallyOccupied = allTunnels
+        .Where(record => IsRemotePortInUse(record.Protocol, record.RemotePort))
+        .Select(record => record.RemotePort)
+        .Distinct()
+        .Order()
+        .ToArray();
 
     await WriteJsonAsync(responseStream, HttpStatusCode.OK, new StatsResponse
     {
@@ -1644,6 +1849,57 @@ static string GetAdminPageHtml()
         .refresh-btn:hover {
             background: #5568d3;
         }
+        .toolbar {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .action-btn {
+            border: none;
+            padding: 8px 12px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 13px;
+            color: white;
+            background: #667eea;
+        }
+        .action-btn:hover {
+            filter: brightness(0.94);
+        }
+        .action-btn:disabled {
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+        .danger-btn {
+            background: #d32f2f;
+        }
+        .secondary-btn {
+            background: #455a64;
+        }
+        .message {
+            display: none;
+            margin-bottom: 16px;
+            padding: 12px 14px;
+            border-radius: 5px;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+        .message-ok {
+            display: block;
+            background: #e8f5e9;
+            color: #1b5e20;
+        }
+        .message-error {
+            display: block;
+            background: #ffebee;
+            color: #b71c1c;
+        }
+        .notice {
+            margin-bottom: 16px;
+            color: #5f6368;
+            font-size: 14px;
+            line-height: 1.5;
+        }
         table {
             width: 100%;
             border-collapse: collapse;
@@ -1734,8 +1990,13 @@ static string GetAdminPageHtml()
         <div class="tunnels-section">
             <div class="section-header">
                 <h2>📋 隧道记录</h2>
-                <button class="refresh-btn" onclick="loadData()">🔄 刷新</button>
+                <div class="toolbar">
+                    <button class="refresh-btn" onclick="loadData()">🔄 刷新</button>
+                    <button class="action-btn secondary-btn" onclick="pruneOfflineTunnels()">清理离线记录</button>
+                </div>
             </div>
+            <div class="notice">离线隧道可直接释放端口；在线隧道强制关闭会重启本程序托管的 frps，并断开所有当前在线隧道。</div>
+            <div id="messageBox" class="message"></div>
             <div id="tunnelsTable">
                 <div class="loading">加载中...</div>
             </div>
@@ -1796,6 +2057,7 @@ static string GetAdminPageHtml()
                             <th>公网端口</th>
                             <th>代理名称</th>
                             <th>创建时间</th>
+                            <th>操作</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1810,6 +2072,16 @@ static string GetAdminPageHtml()
                                 <td><strong>${t.RemotePort}</strong></td>
                                 <td style="font-size: 12px; color: #666;">${escapeHtml(t.ProxyName)}</td>
                                 <td>${formatTime(t.Time)}</td>
+                                <td>
+                                    <button class="action-btn ${t.IsOnline ? 'danger-btn' : 'secondary-btn'}"
+                                        data-port="${t.RemotePort}"
+                                        data-protocol="${escapeHtml(t.Protocol)}"
+                                        data-proxy="${escapeHtml(t.ProxyName)}"
+                                        data-online="${t.IsOnline ? 'true' : 'false'}"
+                                        onclick="releaseTunnelFromButton(this)">
+                                        ${t.IsOnline ? '强制关闭' : '释放端口'}
+                                    </button>
+                                </td>
                             </tr>
                         `).join('')}
                     </tbody>
@@ -1821,6 +2093,87 @@ static string GetAdminPageHtml()
             } catch (err) {
                 document.getElementById('tunnelsTable').innerHTML =
                     `<div class="empty">加载失败: ${err.message}</div>`;
+            }
+        }
+
+        function setMessage(text, ok) {
+            const box = document.getElementById('messageBox');
+            if (!box) return;
+            box.textContent = text || '';
+            box.className = text ? `message ${ok ? 'message-ok' : 'message-error'}` : 'message';
+        }
+
+        async function readApiMessage(response) {
+            try {
+                const data = await response.json();
+                return data.Message || `HTTP ${response.status}`;
+            } catch {
+                return `HTTP ${response.status}`;
+            }
+        }
+
+        async function postTunnelAdmin(path, body) {
+            const headers = Object.assign({ 'Content-Type': 'application/json' }, authHeaders());
+            const response = await fetch(path, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body)
+            });
+
+            if (response.status === 401) {
+                localStorage.removeItem('frpquick_api_secret');
+                location.href = '/admin';
+                return null;
+            }
+
+            const message = await readApiMessage(response);
+            if (!response.ok) {
+                throw new Error(message);
+            }
+
+            return message;
+        }
+
+        async function releaseTunnelFromButton(button) {
+            const port = Number(button.dataset.port);
+            const protocol = button.dataset.protocol || 'tcp';
+            const proxyName = button.dataset.proxy || '';
+            const isOnline = button.dataset.online === 'true';
+            const force = isOnline;
+
+            if (isOnline) {
+                const confirmed = confirm(`端口 ${port} 当前在线。强制关闭会重启 frps，并断开所有在线隧道。是否继续？`);
+                if (!confirmed) return;
+            }
+
+            button.disabled = true;
+            setMessage('', true);
+            try {
+                const message = await postTunnelAdmin('/api/tunnels/release', {
+                    RemotePort: port,
+                    Protocol: protocol,
+                    ProxyName: proxyName,
+                    Force: force
+                });
+                if (message === null) return;
+                setMessage(message, true);
+                await loadData();
+            } catch (err) {
+                setMessage(err.message, false);
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function pruneOfflineTunnels() {
+            setMessage('', true);
+            try {
+                const message = await postTunnelAdmin('/api/tunnels/prune-offline', {});
+                if (message === null) return;
+                setMessage(message, true);
+                await loadData();
+            } catch (err) {
+                setMessage(err.message, false);
             }
         }
 

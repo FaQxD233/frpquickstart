@@ -69,10 +69,19 @@ public sealed class StatsResponse
     public int[] OccupiedPorts { get; set; } = Array.Empty<int>();
 }
 
+public sealed class TunnelAdminRequest
+{
+    public int RemotePort { get; set; }
+    public string Protocol { get; set; } = "tcp";
+    public string ProxyName { get; set; } = "";
+    public bool Force { get; set; }
+}
+
 [JsonSerializable(typeof(TunnelRequest))]
 [JsonSerializable(typeof(TunnelResponse))]
 [JsonSerializable(typeof(HealthResponse))]
 [JsonSerializable(typeof(TunnelRecord))]
 [JsonSerializable(typeof(TunnelListResponse))]
 [JsonSerializable(typeof(StatsResponse))]
+[JsonSerializable(typeof(TunnelAdminRequest))]
 public partial class FrpQuickJsonContext : JsonSerializerContext;
