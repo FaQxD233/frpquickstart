@@ -20,6 +20,7 @@ Ubuntu 防火墙/云安全组放行：
    - 控制服务端口，默认 `9080/tcp`
    - frps 端口，默认 `7000/tcp`
    - 你要暴露给外网访问的公网端口，例如 `25565/tcp`
+   - 如果使用 `--tls acme`，还需要公网 `80/tcp` 可访问，供 Let's Encrypt HTTP-01 校验使用
 
 ## Ubuntu 端
 
@@ -40,6 +41,21 @@ chmod +x frpquick-server
 }
 ```
 
+生产环境建议启用 TLS。可选模式：
+
+- `acme`: 调用 `acme.sh` 自动申请 Let's Encrypt shortlived IP 证书，客户端自动信任。
+- `self-signed`: 自动生成自签证书，客户端必须配置证书 SHA256 指纹。
+- `none`: 明文 HTTP，仅限本地测试或受信网络。
+
+ACME 模式示例：
+
+```bash
+# 前提：已安装 acme.sh，且公网 IP 的 80/tcp 可访问
+./frpquick-server --tls acme --acme-id <你的公网IP> --acme-email admin@example.com
+```
+
+ACME 模式默认会申请 7 天有效期的 Let's Encrypt shortlived IP 证书，并安装到 `runtime/acme/fullchain.pem` 和 `runtime/acme/key.pem`。`acme.sh` 续期覆盖证书文件后，服务端会在新连接握手前自动重新加载。
+
 配置项较多，直接改对应字段即可。常用字段：
 
 - `ControlPort`: Windows 客户端连接的控制端口，默认 `9080`
@@ -47,6 +63,11 @@ chmod +x frpquick-server
 - `AllowedRemotePortStart` / `AllowedRemotePortEnd`: 允许客户端申请的公网端口范围
 - `ApiSecret`: Windows 客户端请求控制服务的密钥
 - `FrpAuthToken`: frpc/frps 的认证 token
+- `TlsMode`: `none` / `self-signed` / `acme`
+- `AcmeIdentifier`: ACME 标识符，IP 证书填写公网 IP
+- `AcmeRenewDays`: acme.sh 续期阈值，默认 `7`
+- `AcmeProfile`: 默认 `shortlived`
+- `AcmeKeyLength`: 默认 `2048`
 
 ## Windows 端
 
@@ -70,7 +91,23 @@ chmod +x frpquick-server
 也可以一次性传参：
 
 ```powershell
-.\frpquick-client.exe --server 1.2.3.4 --control-port 9080 --remote-port 25565 --local-ip 127.0.0.1 --local-port 25565 --secret <密钥>
+.\frpquick-client.exe --server 1.2.3.4 --control-port 9080 --tls acme --remote-port 25565 --local-ip 127.0.0.1 --local-port 25565 --secret <密钥>
+```
+
+如果服务端是 `self-signed` 模式，需要额外传入 `--tls-fingerprint <证书指纹>`。客户端在 TLS 验证失败时不会自动降级到 HTTP。
+
+## 管理界面
+
+服务端内置 Web 管理界面：
+
+```text
+https://<服务器IP>:9080/admin
+```
+
+管理界面和管理 API 需要 API 密钥认证。浏览器访问 `/admin` 时输入 `server-config.json` 中的 `ApiSecret` 即可。直接调用 API 时使用：
+
+```bash
+curl -H "X-Api-Secret: <API密钥>" https://<服务器IP>:9080/api/stats
 ```
 
 ## 发布
@@ -95,7 +132,10 @@ Linux x64：
 ./release/publish-linux-on-ubuntu.sh
 ```
 
-发布产物会输出到 `artifacts` 目录。
+发布产物会输出到 `artifacts` 目录。当前 `release/` 目录也保留了可直接分发的压缩包：
+
+- `release/frpquick-server-linux-x64.tar.gz`
+- `release/frpquick-client-win-x64.tar.gz`
 
 当前默认产物：
 
@@ -106,4 +146,4 @@ Linux x64：
 
 ## 注意
 
-默认控制服务是 HTTP，密钥会经过网络传输。生产环境建议只给可信 IP 放行控制端口，或在前面加 HTTPS 反向代理。
+生产环境必须使用 `--tls acme` 或 `--tls self-signed`。`none` 模式会用明文 HTTP 传输 API 密钥，只适合本机测试或受信网络。
