@@ -1,5 +1,42 @@
 # FRP QuickStart
 
+> 重要：生产环境请优先使用 `--tls acme`。它会通过 `acme.sh` 申请 Let's Encrypt 7 天 shortlived IP 证书；客户端可以直接粘贴服务端打印的 `frpquick://` 分享链接完成服务器、TLS 和密钥配置。
+
+## 文档导航
+
+- [快速开始](docs/快速开始.md): 最短路径完成服务端部署和 Windows 客户端连接。
+- [服务端安装指南](docs/服务端安装指南.md): systemd、自启动、ACME shortlived IP 证书、防火墙和升级说明。
+- [客户端安装指南](docs/客户端安装指南.md): 交互式输入、命令行参数、分享链接、开机自启和故障排查。
+- [Web 管理界面使用指南](docs/管理界面使用指南.md): `/admin` 页面、管理 API 和 API 密钥认证。
+
+## 关键特性
+
+- 内置 frp `v0.69.1`，发布包里已经包含 `frpc`/`frps`，目标机器不需要单独下载 frp。
+- 服务端支持 `acme`、`self-signed`、`none` 三种控制面 TLS 模式。
+- `acme` 模式会调用 `acme.sh` 获取 Let's Encrypt shortlived IP 证书，默认 `--cert-profile shortlived --days 7 --keylength 2048`。
+- ACME 证书安装到 `runtime/acme/fullchain.pem` 和 `runtime/acme/key.pem`，续期覆盖文件后服务端会在新连接握手前自动重新加载。
+- 服务端会打印 `frpquick://` 分享链接，客户端粘贴后自动导入服务器地址、控制端口、TLS 模式、API 密钥和自签证书指纹。
+- 客户端仍保留手动交互式配置，不传参数时会逐项提示输入。
+- Web 管理界面和管理 API 需要 `ApiSecret` 认证。
+- 客户端 TLS 验证失败时不会自动降级到 HTTP。
+
+## 最短用法
+
+服务端：
+
+```bash
+curl https://get.acme.sh | sh -s email=admin@example.com
+./frpquick-server --tls acme --acme-id <你的公网IP> --acme-email admin@example.com
+```
+
+记录服务端打印的 `frpquick://...` 分享链接。
+
+客户端：
+
+```powershell
+.\frpquick-client.exe --share "frpquick://<服务器IP>:9080/?tls=acme&secret=<API密钥>" --remote-port 25565 --local-port 25565
+```
+
 这是一个简化 frp 使用流程的命令行工具：
 
 - `frpquick-server`: 跑在 Ubuntu 服务器上，启动/管理 `frps`，接收 Windows 客户端发来的穿透请求。
@@ -56,6 +93,14 @@ ACME 模式示例：
 
 ACME 模式默认会申请 7 天有效期的 Let's Encrypt shortlived IP 证书，并安装到 `runtime/acme/fullchain.pem` 和 `runtime/acme/key.pem`。`acme.sh` 续期覆盖证书文件后，服务端会在新连接握手前自动重新加载。
 
+服务端启动后还会打印一条客户端分享链接：
+
+```text
+frpquick://<服务器公网IP>:9080/?tls=acme&secret=<API密钥>
+```
+
+如果 `PublicAddress` 为空，服务端会尝试自动查询公网 IPv4 来生成链接。分享链接包含 API 密钥和 TLS 配置，只能发给可信用户。
+
 配置项较多，直接改对应字段即可。常用字段：
 
 - `ControlPort`: Windows 客户端连接的控制端口，默认 `9080`
@@ -77,7 +122,7 @@ ACME 模式默认会申请 7 天有效期的 Let's Encrypt shortlived IP 证书�
 .\frpquick-client.exe
 ```
 
-按提示输入：
+按提示输入。第一项可以输入服务器 IP/域名，也可以直接粘贴服务端打印的 `frpquick://` 分享链接：
 
 - Ubuntu 控制服务 IP/域名
 - Ubuntu 控制服务端口，默认 `9080`
@@ -92,6 +137,12 @@ ACME 模式默认会申请 7 天有效期的 Let's Encrypt shortlived IP 证书�
 
 ```powershell
 .\frpquick-client.exe --server 1.2.3.4 --control-port 9080 --tls acme --remote-port 25565 --local-ip 127.0.0.1 --local-port 25565 --secret <密钥>
+```
+
+使用分享链接：
+
+```powershell
+.\frpquick-client.exe --share "frpquick://1.2.3.4:9080/?tls=acme&secret=<密钥>" --remote-port 25565 --local-port 25565
 ```
 
 如果服务端是 `self-signed` 模式，需要额外传入 `--tls-fingerprint <证书指纹>`。客户端在 TLS 验证失败时不会自动降级到 HTTP。

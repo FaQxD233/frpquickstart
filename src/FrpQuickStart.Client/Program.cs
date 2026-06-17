@@ -22,12 +22,44 @@ Console.WriteLine("FRP QuickStart Windows Client");
 Console.WriteLine("请按提示填写 Ubuntu 服务器和本地服务信息。");
 Console.WriteLine();
 
-var serverHost = GetOption(args, "--server") ?? PromptRequired("Ubuntu 控制服务 IP/域名");
-var controlPort = GetIntOption(args, "--control-port") ?? PromptPort("Ubuntu 控制服务端口", 9080);
+var shareLink = GetOption(args, "--share");
+ShareLinkConfig? shareConfig = null;
+string? serverHostFromInput = null;
+if (!string.IsNullOrWhiteSpace(shareLink))
+{
+    if (!TryParseShareLink(shareLink, out shareConfig, out var error))
+    {
+        Console.Error.WriteLine($"分享链接无效: {error}");
+        return;
+    }
+
+    Console.WriteLine($"已导入分享链接配置: {shareConfig!.Server}:{shareConfig.ControlPort} ({shareConfig.TlsMode})");
+}
+else
+{
+    var serverInput = GetOption(args, "--server") ?? PromptRequired("Ubuntu 控制服务 IP/域名或分享链接");
+    if (TryParseShareLink(serverInput, out shareConfig, out _))
+    {
+        Console.WriteLine($"已导入分享链接配置: {shareConfig!.Server}:{shareConfig.ControlPort} ({shareConfig.TlsMode})");
+    }
+    else
+    {
+        serverHostFromInput = serverInput;
+    }
+}
+
+var serverHost = shareConfig?.Server ?? serverHostFromInput ?? GetOption(args, "--server");
+if (string.IsNullOrWhiteSpace(serverHost))
+{
+    Console.Error.WriteLine("缺少 Ubuntu 控制服务 IP/域名。");
+    return;
+}
+
+var controlPort = GetIntOption(args, "--control-port") ?? shareConfig?.ControlPort ?? PromptPort("Ubuntu 控制服务端口", 9080);
 var remotePort = GetIntOptionRequired(args, "--remote-port") ?? PromptPort("要开放在服务器上的公网端口", null);
 var localIp = GetOption(args, "--local-ip") ?? PromptWithDefault("本地监听 IP", "127.0.0.1");
 var localPort = GetIntOptionRequired(args, "--local-port") ?? PromptPort("本地监听端口", null);
-var secret = GetOption(args, "--secret") ?? PromptSecret("连接密钥");
+var secret = GetOption(args, "--secret") ?? shareConfig?.Secret ?? PromptSecret("连接密钥");
 var protocol = (GetOption(args, "--protocol") ?? "tcp").Trim().ToLowerInvariant();
 var bundledFrpcResource = OperatingSystem.IsWindows() ? "FrpQuickStart.Bundled.frpc.exe" : null;
 var frpcPath = ProcessHelpers.ResolveExecutable(GetOption(args, "--frpc"), "frpc", bundledFrpcResource);
@@ -39,6 +71,7 @@ if (protocol is not "tcp" and not "udp")
 }
 
 var tlsMode = GetOption(args, "--tls")?.Trim().ToLowerInvariant()
+    ?? shareConfig?.TlsMode
     ?? PromptWithDefault("TLS 加密模式 [none/self-signed/acme]", "none");
 if (tlsMode is not "none" and not "self-signed" and not "acme")
 {
@@ -50,6 +83,7 @@ string? tlsFingerprint = null;
 if (tlsMode == "self-signed")
 {
     tlsFingerprint = GetOption(args, "--tls-fingerprint")
+        ?? shareConfig?.TlsFingerprint
         ?? PromptRequired("服务器 TLS 证书指纹 (SHA256，服务端启动时显示)");
 }
 
@@ -301,6 +335,88 @@ static string BuildControlUrl(string hostOrUrl, int port, string tlsMode)
     return $"{scheme}://{hostOrUrl}:{port}";
 }
 
+static bool TryParseShareLink(string value, out ShareLinkConfig? config, out string? error)
+{
+    config = null;
+    error = null;
+
+    if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri) ||
+        !string.Equals(uri.Scheme, "frpquick", StringComparison.OrdinalIgnoreCase))
+    {
+        error = "不是 frpquick:// 分享链接。";
+        return false;
+    }
+
+    var parameters = ParseQuery(uri.Query);
+    var server = uri.Host;
+    if (string.IsNullOrWhiteSpace(server) &&
+        parameters.TryGetValue("server", out var serverFromQuery))
+    {
+        server = serverFromQuery;
+    }
+
+    if (string.IsNullOrWhiteSpace(server))
+    {
+        error = "缺少服务器地址。";
+        return false;
+    }
+
+    var controlPort = uri.Port > 0 ? uri.Port : 9080;
+    if (parameters.TryGetValue("controlPort", out var controlPortValue) ||
+        parameters.TryGetValue("port", out controlPortValue))
+    {
+        if (!int.TryParse(controlPortValue, out controlPort) || controlPort is < 1 or > 65535)
+        {
+            error = "控制端口无效。";
+            return false;
+        }
+    }
+
+    var tlsMode = parameters.TryGetValue("tls", out var tlsValue) ? tlsValue.Trim().ToLowerInvariant() : "none";
+    if (tlsMode is not "none" and not "self-signed" and not "acme")
+    {
+        error = $"TLS 模式无效: {tlsMode}";
+        return false;
+    }
+
+    if (!parameters.TryGetValue("secret", out var secret) || string.IsNullOrWhiteSpace(secret))
+    {
+        error = "缺少 API 密钥。";
+        return false;
+    }
+
+    parameters.TryGetValue("fp", out var fingerprint);
+    if (string.IsNullOrWhiteSpace(fingerprint))
+    {
+        parameters.TryGetValue("fingerprint", out fingerprint);
+    }
+
+    config = new ShareLinkConfig(server, controlPort, tlsMode, secret, fingerprint ?? "");
+    return true;
+}
+
+static Dictionary<string, string> ParseQuery(string query)
+{
+    var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    if (string.IsNullOrWhiteSpace(query))
+    {
+        return result;
+    }
+
+    var body = query.StartsWith("?", StringComparison.Ordinal) ? query[1..] : query;
+    foreach (var part in body.Split('&', StringSplitOptions.RemoveEmptyEntries))
+    {
+        var pair = part.Split('=', 2);
+        var key = Uri.UnescapeDataString(pair[0].Replace("+", " ", StringComparison.Ordinal));
+        var queryValue = pair.Length == 2
+            ? Uri.UnescapeDataString(pair[1].Replace("+", " ", StringComparison.Ordinal))
+            : "";
+        result[key] = queryValue;
+    }
+
+    return result;
+}
+
 static string PromptRequired(string label)
 {
     while (true)
@@ -453,6 +569,7 @@ static void PrintHelp()
 
     常用选项:
       --server <ip或域名>          Ubuntu 控制服务 IP/域名
+      --share <frpquick链接>       服务端打印的分享链接，可自动导入服务器/TLS/密钥配置
       --control-port <端口>       Ubuntu 控制服务端口，默认 9080
       --remote-port <端口>        要开放在服务器上的公网端口
       --local-ip <ip>             本地监听 IP，默认 127.0.0.1
@@ -465,7 +582,7 @@ static void PrintHelp()
       --tls <mode>                TLS 模式: none (默认) / self-signed / acme
       --tls-fingerprint <SHA256>  自签证书指纹 (self-signed 模式)
 
-    不传选项时会逐项询问。
+    不传选项时会逐项询问。也可以在“Ubuntu 控制服务 IP/域名或分享链接”提示处直接粘贴 frpquick:// 分享链接。
 
     TLS 模式说明:
       none        - 明文 HTTP，仅限受信网络/内网使用
@@ -475,3 +592,10 @@ static void PrintHelp()
     安全提示: 使用 --tls self-signed 或 --tls acme 可加密控制平面通信。
     """);
 }
+
+internal sealed record ShareLinkConfig(
+    string Server,
+    int ControlPort,
+    string TlsMode,
+    string Secret,
+    string TlsFingerprint);

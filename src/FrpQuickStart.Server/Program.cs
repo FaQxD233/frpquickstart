@@ -149,6 +149,18 @@ else
 {
     Console.WriteLine($"安全: 控制平面已启用 TLS ({tlsMode})。");
 }
+
+var shareAddress = await ResolveShareAddressAsync(settings, args);
+if (string.IsNullOrWhiteSpace(shareAddress))
+{
+    Console.WriteLine("[警告] 无法确定公网地址，未生成客户端分享链接。请设置 PublicAddress 或使用 --acme-id <公网IP>。");
+}
+else
+{
+    var shareLink = BuildShareLink(shareAddress, settings.ControlPort, tlsMode, settings.ApiSecret, tlsFingerprint);
+    Console.WriteLine("客户端分享链接（包含 API 密钥，请只发给可信用户）:");
+    Console.WriteLine(shareLink);
+}
 Console.WriteLine();
 
 Process? frpsProcess = null;
@@ -597,6 +609,13 @@ static async Task RunAcmeShAsync(string acmeShPath, IReadOnlyCollection<string> 
     if (process.ExitCode != 0)
     {
         var message = $"acme.sh 退出码 {process.ExitCode}: {stderr}";
+        if (process.ExitCode == 2 && arguments.Contains("--issue"))
+        {
+            Console.WriteLine($"ACME: {message}");
+            Console.WriteLine("ACME: 证书未到续期窗口，继续使用已安装证书。");
+            return;
+        }
+
         if (required)
         {
             throw new InvalidOperationException(message);
@@ -1168,6 +1187,97 @@ static IPAddress GetBindAddress(string bindAddress)
     return addresses.FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork) ??
         addresses.FirstOrDefault() ??
         throw new InvalidOperationException($"无法解析控制服务监听地址: {bindAddress}");
+}
+
+static async Task<string> ResolveShareAddressAsync(ServerSettings settings, string[] args)
+{
+    var configured = GetOption(args, "--acme-id");
+    if (string.IsNullOrWhiteSpace(configured))
+    {
+        configured = settings.AcmeIdentifier;
+    }
+
+    if (string.IsNullOrWhiteSpace(configured))
+    {
+        configured = settings.PublicAddress;
+    }
+
+    configured = NormalizeShareAddress(configured);
+    if (!string.IsNullOrWhiteSpace(configured))
+    {
+        return configured;
+    }
+
+    var discovered = await TryDiscoverPublicIpv4Async();
+    return discovered ?? "";
+}
+
+static string NormalizeShareAddress(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return "";
+    }
+
+    var trimmed = value.Trim();
+    if (trimmed is "0.0.0.0" or "*" || string.Equals(trimmed, "localhost", StringComparison.OrdinalIgnoreCase))
+    {
+        return "";
+    }
+
+    if (Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) && !string.IsNullOrWhiteSpace(uri.Host))
+    {
+        return uri.Host;
+    }
+
+    return trimmed;
+}
+
+static async Task<string?> TryDiscoverPublicIpv4Async()
+{
+    var endpoints = new[]
+    {
+        "https://api.ipify.org",
+        "https://ip.sb",
+        "https://ipv4.icanhazip.com"
+    };
+
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+    foreach (var endpoint in endpoints)
+    {
+        try
+        {
+            var value = (await http.GetStringAsync(endpoint)).Trim();
+            if (IPAddress.TryParse(value, out var ip) && ip.AddressFamily == AddressFamily.InterNetwork)
+            {
+                return value;
+            }
+        }
+        catch
+        {
+            // Try the next public IP service.
+        }
+    }
+
+    return null;
+}
+
+static string BuildShareLink(string serverAddress, int controlPort, string tlsMode, string apiSecret, string? tlsFingerprint)
+{
+    var builder = new UriBuilder("frpquick", serverAddress, controlPort);
+    var query = new List<string>
+    {
+        "tls=" + Uri.EscapeDataString(tlsMode),
+        "secret=" + Uri.EscapeDataString(apiSecret)
+    };
+
+    if (!string.IsNullOrWhiteSpace(tlsFingerprint))
+    {
+        query.Add("fp=" + Uri.EscapeDataString(tlsFingerprint));
+    }
+
+    builder.Query = string.Join("&", query);
+    return builder.Uri.ToString();
 }
 
 static string ReasonPhrase(HttpStatusCode statusCode)
