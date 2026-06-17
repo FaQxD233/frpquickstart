@@ -1021,6 +1021,7 @@ static async Task ServeStats(Stream responseStream, string runtimeDir, HashSet<i
     var tunnelsFile = Path.Combine(runtimeDir, "tunnels.jsonl");
     var totalTunnels = 0;
     var uniqueClients = new HashSet<string>();
+    var allPorts = new HashSet<int>();
 
     if (File.Exists(tunnelsFile))
     {
@@ -1031,27 +1032,28 @@ static async Task ServeStats(Stream responseStream, string runtimeDir, HashSet<i
             try
             {
                 var record = JsonSerializer.Deserialize(line, FrpQuickJsonContext.Default.TunnelRecord);
-                if (record != null && !string.IsNullOrEmpty(record.ClientName))
+                if (record != null)
                 {
-                    uniqueClients.Add(record.ClientName);
+                    if (!string.IsNullOrEmpty(record.ClientName))
+                    {
+                        uniqueClients.Add(record.ClientName);
+                    }
+                    allPorts.Add(record.RemotePort);
                 }
             }
             catch { /* 跳过 */ }
         }
     }
 
-    int[] occupiedPorts;
-    lock (allocatedPortsLock)
-    {
-        occupiedPorts = allocatedPorts.ToArray();
-    }
+    // 实时检测哪些端口真正在线
+    var actuallyOccupied = allPorts.Where(IsPortListening).ToArray();
 
     await WriteJsonAsync(responseStream, HttpStatusCode.OK, new StatsResponse
     {
         Success = true,
         TotalTunnels = totalTunnels,
         UniqueClients = uniqueClients.Count,
-        OccupiedPorts = occupiedPorts
+        OccupiedPorts = actuallyOccupied
     }, FrpQuickJsonContext.Default.StatsResponse);
 }
 
