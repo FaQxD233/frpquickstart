@@ -7,4 +7,12 @@
   <ItemGroup>
     <ProjectReference Include="..\FrpQuickStart.Shared\FrpQuickStart.Shared.csproj" />
   </ItemGroup>
+
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' Or ('$(RuntimeIdentifier)' == '' And '$(OS)' != 'Windows_NT')">
+    <EmbeddedResource Include="..\..\third_party\frp\v0.69.1\linux-x64\frps" LogicalName="FrpQuickStart.Bundled.frps" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' Or ('$(RuntimeIdentifier)' == '' And '$(OS)' == 'Windows_NT')">
+    <EmbeddedResource Include="..\..\third_party\frp\v0.69.1\win-x64\frps.exe" LogicalName="FrpQuickStart.Bundled.frps.exe" />
+  </ItemGroup>
 </Project>

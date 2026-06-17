@@ -17,12 +17,13 @@ Console.WriteLine();
 
 var serverHost = GetOption(args, "--server") ?? PromptRequired("Ubuntu 控制服务 IP/域名");
 var controlPort = GetIntOption(args, "--control-port") ?? PromptPort("Ubuntu 控制服务端口", 9080);
-var remotePort = GetIntOption(args, "--remote-port") ?? PromptPort("要开放在服务器上的公网端口", null);
+var remotePort = GetIntOptionRequired(args, "--remote-port") ?? PromptPort("要开放在服务器上的公网端口", null);
 var localIp = GetOption(args, "--local-ip") ?? PromptWithDefault("本地监听 IP", "127.0.0.1");
-var localPort = GetIntOption(args, "--local-port") ?? PromptPort("本地监听端口", null);
+var localPort = GetIntOptionRequired(args, "--local-port") ?? PromptPort("本地监听端口", null);
 var secret = GetOption(args, "--secret") ?? PromptSecret("连接密钥");
 var protocol = (GetOption(args, "--protocol") ?? "tcp").Trim().ToLowerInvariant();
-var frpcPath = ProcessHelpers.ResolveExecutable(GetOption(args, "--frpc") ?? "frpc", "frpc");
+var bundledFrpcResource = OperatingSystem.IsWindows() ? "FrpQuickStart.Bundled.frpc.exe" : null;
+var frpcPath = ProcessHelpers.ResolveExecutable(GetOption(args, "--frpc"), "frpc", bundledFrpcResource);
 
 if (protocol is not "tcp" and not "udp")
 {
@@ -73,7 +74,7 @@ var frpServerAddress = string.IsNullOrWhiteSpace(response.FrpServerAddress)
     ? serverHost
     : response.FrpServerAddress;
 var proxyName = string.IsNullOrWhiteSpace(response.ProxyName)
-    ? FrpConfigWriter.SafeProxyName(clientName, remotePort)
+    ? FrpConfigWriter.SafeProxyName(clientName, remotePort, protocol)
     : response.ProxyName;
 var runtimeDir = Path.Combine(Environment.CurrentDirectory, "runtime");
 var frpcConfigPath = Path.Combine(runtimeDir, $"frpc-{remotePort}.toml");
@@ -180,11 +181,13 @@ static string PromptSecret(string label)
             break;
         }
 
+        // QUAL-4 FIX: 退格键回显删除效果
         if (key.Key == ConsoleKey.Backspace)
         {
             if (secret.Length > 0)
             {
                 secret.Length--;
+                Console.Write("\b \b"); // 回退、空格覆盖、再回退
             }
 
             continue;
@@ -212,10 +215,44 @@ static string? GetOption(string[] args, string name)
     return null;
 }
 
+/// <summary>
+/// 可选的整数参数解析，参数不存在时返回 null（进入交互提示）。
+/// </summary>
 static int? GetIntOption(string[] args, string name)
 {
     var value = GetOption(args, name);
+    if (value is null)
+    {
+        return null;
+    }
+
     return int.TryParse(value, out var parsed) ? parsed : null;
+}
+
+/// <summary>
+/// QUAL-3 FIX: 必需的整数参数解析，参数存在但无法解析为数字时 print error and exit。
+/// 用于 --remote-port 和 --local-port 这类必需参数。
+/// </summary>
+static int? GetIntOptionRequired(string[] args, string name)
+{
+    // 检查参数是否存在于命令行
+    for (var i = 0; i < args.Length - 1; i++)
+    {
+        if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+        {
+            var value = args[i + 1];
+            if (int.TryParse(value, out var parsed) && parsed is >= 1 and <= 65535)
+            {
+                return parsed;
+            }
+
+            Console.Error.WriteLine($"错误: {name} 的值 '{value}' 不是有效的端口号 (1-65535)。");
+            Environment.ExitCode = 1;
+            return null;
+        }
+    }
+
+    return null;
 }
 
 static void StopChild(Process? process)
@@ -249,8 +286,10 @@ static void PrintHelp()
       --local-port <端口>         本地监听端口
       --secret <密钥>             Ubuntu 端打印的 API 密钥
       --protocol <tcp|udp>        默认 tcp
-      --frpc <路径>               frpc.exe 路径，默认同目录或 PATH
+      --frpc <路径>               自定义 frpc.exe 路径，默认使用内置 frpc
 
     不传选项时会逐项询问。
+
+    安全提示: 控制平面使用明文 HTTP，请确保仅在受信网络/内网中使用。
     """);
 }
