@@ -460,6 +460,7 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
 {
     try
     {
+        // GET /health - 健康检查
         if (httpRequest.Method == "GET" && httpRequest.Path == "/health")
         {
             await WriteJsonAsync(responseStream, HttpStatusCode.OK, new HealthResponse
@@ -476,9 +477,31 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
             return;
         }
 
+        // GET /admin - 管理界面
+        if (httpRequest.Method == "GET" && httpRequest.Path == "/admin")
+        {
+            await ServeAdminPage(responseStream);
+            return;
+        }
+
+        // GET /api/tunnels/list - 获取隧道列表
+        if (httpRequest.Method == "GET" && httpRequest.Path == "/api/tunnels/list")
+        {
+            await ServeTunnelsList(responseStream, runtimeDir);
+            return;
+        }
+
+        // GET /api/stats - 统计信息
+        if (httpRequest.Method == "GET" && httpRequest.Path == "/api/stats")
+        {
+            await ServeStats(responseStream, runtimeDir, allocatedPorts, allocatedPortsLock);
+            return;
+        }
+
+        // POST /api/tunnels - 创建隧道（原有接口）
         if (httpRequest.Method != "POST" || httpRequest.Path != "/api/tunnels")
         {
-            await WriteErrorAsync(responseStream, HttpStatusCode.NotFound, "接口不存在。可用接口: GET /health, POST /api/tunnels");
+            await WriteErrorAsync(responseStream, HttpStatusCode.NotFound, "接口不存在。可用接口: GET /health, GET /admin, GET /api/tunnels/list, GET /api/stats, POST /api/tunnels");
             return;
         }
 
@@ -918,6 +941,348 @@ static void PrintHelp()
 
     安全提示: 使用 TLS 加密可防止密钥和 FrpAuthToken 被中间人窃取。
     """);
+}
+
+// 管理界面 API
+static async Task ServeAdminPage(Stream responseStream)
+{
+    var html = GetAdminPageHtml();
+    var bytes = Encoding.UTF8.GetBytes(html);
+
+    var headers = $"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {bytes.Length}\r\n\r\n";
+    var headerBytes = Encoding.UTF8.GetBytes(headers);
+
+    await responseStream.WriteAsync(headerBytes);
+    await responseStream.WriteAsync(bytes);
+    await responseStream.FlushAsync();
+}
+
+static async Task ServeTunnelsList(Stream responseStream, string runtimeDir)
+{
+    var tunnelsFile = Path.Combine(runtimeDir, "tunnels.jsonl");
+    var tunnels = new List<TunnelRecord>();
+
+    if (File.Exists(tunnelsFile))
+    {
+        foreach (var line in File.ReadLines(tunnelsFile))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            try
+            {
+                var record = JsonSerializer.Deserialize(line, FrpQuickJsonContext.Default.TunnelRecord);
+                if (record != null) tunnels.Add(record);
+            }
+            catch { /* 跳过损坏的行 */ }
+        }
+    }
+
+    // 按时间倒序
+    tunnels.Reverse();
+
+    await WriteJsonAsync(responseStream, HttpStatusCode.OK, new TunnelListResponse
+    {
+        Success = true,
+        Tunnels = tunnels
+    }, FrpQuickJsonContext.Default.TunnelListResponse);
+}
+
+static async Task ServeStats(Stream responseStream, string runtimeDir, HashSet<int> allocatedPorts, object allocatedPortsLock)
+{
+    var tunnelsFile = Path.Combine(runtimeDir, "tunnels.jsonl");
+    var totalTunnels = 0;
+    var uniqueClients = new HashSet<string>();
+
+    if (File.Exists(tunnelsFile))
+    {
+        foreach (var line in File.ReadLines(tunnelsFile))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            totalTunnels++;
+            try
+            {
+                var record = JsonSerializer.Deserialize(line, FrpQuickJsonContext.Default.TunnelRecord);
+                if (record != null && !string.IsNullOrEmpty(record.ClientName))
+                {
+                    uniqueClients.Add(record.ClientName);
+                }
+            }
+            catch { /* 跳过 */ }
+        }
+    }
+
+    int[] occupiedPorts;
+    lock (allocatedPortsLock)
+    {
+        occupiedPorts = allocatedPorts.ToArray();
+    }
+
+    await WriteJsonAsync(responseStream, HttpStatusCode.OK, new StatsResponse
+    {
+        Success = true,
+        TotalTunnels = totalTunnels,
+        UniqueClients = uniqueClients.Count,
+        OccupiedPorts = occupiedPorts
+    }, FrpQuickJsonContext.Default.StatsResponse);
+}
+
+static string GetAdminPageHtml()
+{
+    return """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FRP QuickStart 管理面板</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            background: rgba(255,255,255,0.95);
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .header h1 {
+            font-size: 28px;
+            color: #333;
+            margin-bottom: 10px;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: rgba(255,255,255,0.95);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+        .stat-label {
+            color: #666;
+            font-size: 14px;
+        }
+        .tunnels-section {
+            background: rgba(255,255,255,0.95);
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .section-header h2 {
+            font-size: 20px;
+            color: #333;
+        }
+        .refresh-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .refresh-btn:hover {
+            background: #5568d3;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        th {
+            background: #f5f5f5;
+            font-weight: 600;
+            color: #333;
+        }
+        tr:hover {
+            background: #f9f9f9;
+        }
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .badge-tcp {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        .badge-udp {
+            background: #fff3e0;
+            color: #f57c00;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        .empty {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+        .port-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .port-tag {
+            background: #e8eaf6;
+            color: #5c6bc0;
+            padding: 4px 12px;
+            border-radius: 15px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 FRP QuickStart 管理面板</h1>
+            <p style="color: #666; margin-top: 5px;">实时监控和管理内网穿透隧道</p>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-value" id="totalTunnels">-</div>
+                <div class="stat-label">历史隧道总数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="uniqueClients">-</div>
+                <div class="stat-label">独立客户端数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="occupiedPorts">-</div>
+                <div class="stat-label">已占用端口数</div>
+            </div>
+        </div>
+
+        <div class="tunnels-section">
+            <div class="section-header">
+                <h2>📋 隧道记录</h2>
+                <button class="refresh-btn" onclick="loadData()">🔄 刷新</button>
+            </div>
+            <div id="tunnelsTable">
+                <div class="loading">加载中...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function loadData() {
+            try {
+                // 加载统计数据
+                const statsRes = await fetch('/api/stats');
+                const stats = await statsRes.json();
+
+                document.getElementById('totalTunnels').textContent = stats.TotalTunnels;
+                document.getElementById('uniqueClients').textContent = stats.UniqueClients;
+                document.getElementById('occupiedPorts').textContent = stats.OccupiedPorts.length;
+
+                // 加载隧道列表
+                const tunnelsRes = await fetch('/api/tunnels/list');
+                const tunnelsData = await tunnelsRes.json();
+
+                const container = document.getElementById('tunnelsTable');
+
+                if (!tunnelsData.Tunnels || tunnelsData.Tunnels.length === 0) {
+                    container.innerHTML = '<div class="empty">暂无隧道记录</div>';
+                    return;
+                }
+
+                const table = document.createElement('table');
+                table.innerHTML = `
+                    <thead>
+                        <tr>
+                            <th>客户端名称</th>
+                            <th>协议</th>
+                            <th>本地地址</th>
+                            <th>公网端口</th>
+                            <th>代理名称</th>
+                            <th>创建时间</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${tunnelsData.Tunnels.map(t => `
+                            <tr>
+                                <td><strong>${escapeHtml(t.ClientName)}</strong></td>
+                                <td><span class="badge badge-${t.Protocol.toLowerCase()}">${t.Protocol.toUpperCase()}</span></td>
+                                <td>${escapeHtml(t.LocalIp)}:${t.LocalPort}</td>
+                                <td><strong>${t.RemotePort}</strong></td>
+                                <td style="font-size: 12px; color: #666;">${escapeHtml(t.ProxyName)}</td>
+                                <td>${formatTime(t.Time)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                `;
+
+                container.innerHTML = '';
+                container.appendChild(table);
+
+            } catch (err) {
+                document.getElementById('tunnelsTable').innerHTML =
+                    `<div class="empty">加载失败: ${err.message}</div>`;
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatTime(isoString) {
+            const date = new Date(isoString);
+            return date.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        // 页面加载时自动刷新
+        loadData();
+
+        // 每 30 秒自动刷新
+        setInterval(loadData, 30000);
+    </script>
+</body>
+</html>
+""";
 }
 
 internal sealed record SimpleHttpRequest(string Method, string Path, byte[] Body);

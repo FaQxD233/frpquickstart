@@ -54,8 +54,24 @@ public sealed class TunnelRecord
     public string ProxyName { get; set; } = "";
 }
 
+public sealed class TunnelListResponse
+{
+    public bool Success { get; set; }
+    public List<TunnelRecord> Tunnels { get; set; } = new();
+}
+
+public sealed class StatsResponse
+{
+    public bool Success { get; set; }
+    public int TotalTunnels { get; set; }
+    public int UniqueClients { get; set; }
+    public int[] OccupiedPorts { get; set; } = Array.Empty<int>();
+}
+
 [JsonSerializable(typeof(TunnelRequest))]
 [JsonSerializable(typeof(TunnelResponse))]
 [JsonSerializable(typeof(HealthResponse))]
 [JsonSerializable(typeof(TunnelRecord))]
+[JsonSerializable(typeof(TunnelListResponse))]
+[JsonSerializable(typeof(StatsResponse))]
 public partial class FrpQuickJsonContext : JsonSerializerContext;
