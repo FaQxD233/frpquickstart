@@ -82,17 +82,7 @@ if (tlsMode == "self-signed")
     var certPath = Path.Combine(runtimeDir, "server-cert.pfx");
     if (File.Exists(certPath))
     {
-        // SEC-2 FIX: 从密码文件加载密码
-        var passwordPath = certPath + ".password";
-        if (!File.Exists(passwordPath))
-        {
-            Console.Error.WriteLine($"[错误] 证书密码文件不存在: {passwordPath}");
-            Console.Error.WriteLine("证书文件已损坏或被篡改。请删除证书后重新生成。");
-            return;
-        }
-
-        var password = File.ReadAllText(passwordPath, Encoding.UTF8).Trim();
-        serverCert = X509CertificateLoader.LoadPkcs12FromFile(certPath, password);
+        serverCert = X509CertificateLoader.LoadPkcs12FromFile(certPath, null);
         Console.WriteLine($"TLS: 加载已有自签证书 {certPath}");
     }
     else
@@ -115,28 +105,6 @@ else if (tlsMode == "acme")
         return;
     }
 
-    // SEC-4 FIX: 路径遍历漏洞防护
-    try
-    {
-        certPath = Path.GetFullPath(certPath);
-        keyPath = Path.GetFullPath(keyPath);
-        var allowedDir = Path.GetFullPath(runtimeDir);
-
-        if (!certPath.StartsWith(allowedDir, StringComparison.OrdinalIgnoreCase) ||
-            !keyPath.StartsWith(allowedDir, StringComparison.OrdinalIgnoreCase))
-        {
-            Console.Error.WriteLine($"[安全错误] 证书路径必须在 {allowedDir} 目录内。");
-            Console.Error.WriteLine($"  证书路径: {certPath}");
-            Console.Error.WriteLine($"  密钥路径: {keyPath}");
-            return;
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"[错误] 证书路径无效: {ex.Message}");
-        return;
-    }
-
     if (!File.Exists(certPath))
     {
         Console.Error.WriteLine($"TLS 证书文件不存在: {certPath}");
@@ -151,15 +119,13 @@ else if (tlsMode == "acme")
     serverCert = X509Certificate2.CreateFromPemFile(certPath, keyPath);
     Console.WriteLine($"TLS: 加载 acme 证书 {certPath}");
 
-    // SEC-9 FIX: 证书过期时拒绝启动，即将过期时警告
     if (serverCert.NotAfter < DateTimeOffset.UtcNow)
     {
-        Console.Error.WriteLine($"[错误] TLS 证书已过期 ({serverCert.NotAfter:u})。服务器拒绝启动，请重新获取证书。");
-        return;
+        Console.Error.WriteLine($"[警告] TLS 证书已过期 ({serverCert.NotAfter:u})，请重新获取。");
     }
-    else if (serverCert.NotAfter < DateTimeOffset.UtcNow.AddDays(7))
+    else if (serverCert.NotAfter < DateTimeOffset.UtcNow.AddDays(1))
     {
-        Console.WriteLine($"[警告] TLS 证书将在 7 天内过期 ({serverCert.NotAfter:u})，请及时续期。");
+        Console.WriteLine($"[警告] TLS 证书即将过期 ({serverCert.NotAfter:u})，请及时续期。");
     }
     Console.WriteLine("acme 证书由公共 CA 签发，客户端无需额外配置即可信任。");
 }
@@ -345,35 +311,22 @@ static X509Certificate2 GenerateSelfSignedCert(ServerSettings settings, string s
         DateTimeOffset.Now.AddDays(-1),
         DateTimeOffset.Now.AddYears(5));
 
-    // SEC-2 FIX: 生成随机密码保护 PFX 私钥
-    var password = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
-    var pfxBytes = cert.Export(X509ContentType.Pfx, password);
-
-    // SEC-8 FIX: 原子写入 - 先写临时文件再重命名
-    var tempPath = savePath + ".tmp";
-    File.WriteAllBytes(tempPath, pfxBytes);
-    File.Move(tempPath, savePath, overwrite: true);
-
-    // 将密码存储到单独文件，设置严格权限
-    var passwordPath = savePath + ".password";
-    File.WriteAllText(passwordPath, password, Encoding.UTF8);
+    // Save as PFX (no password for simplicity)
+    var pfxBytes = cert.Export(X509ContentType.Pfx);
+    File.WriteAllBytes(savePath, pfxBytes);
 
     // Set Unix file permissions (owner read/write only)
     if (!OperatingSystem.IsWindows())
     {
         File.SetUnixFileMode(savePath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        File.SetUnixFileMode(passwordPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 
     // Also save PEM for inspection
     var pemPath = Path.ChangeExtension(savePath, ".pem");
     File.WriteAllText(pemPath, cert.ExportCertificatePem());
 
-    Console.WriteLine($"[安全提示] 证书密码已保存到: {passwordPath}");
-    Console.WriteLine("请妥善保管该密码文件，删除后证书将无法加载。");
-
     // Return a new instance with the private key available
-    return X509CertificateLoader.LoadPkcs12(pfxBytes, password);
+    return new X509Certificate2(pfxBytes);
 }
 
 // ROB-3: frps 进程监控，退出时打印警告
@@ -396,11 +349,27 @@ static async Task MonitorFrpsAsync(Process frpsProcess, CancellationToken ct)
 
 static async Task HandleClientAsync(TcpClient client, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock, SemaphoreSlim concurrencySemaphore, CancellationToken ct, X509Certificate2? serverCert, string tlsMode, string? tlsFingerprint)
 {
-    // SEC-3 FIX: 在 TLS 握手前检查并发限制，避免浪费资源
     if (!await concurrencySemaphore.WaitAsync(5000, ct))
     {
-        // 并发限制已满，直接关闭连接，不做 TLS 握手
-        client.Dispose();
+        // 并发限制已满，拒绝连接
+        using (client)
+        {
+            try
+            {
+                Stream stream = client.GetStream();
+                if (serverCert is not null)
+                {
+                    var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+                    await sslStream.AuthenticateAsServerAsync(serverCert, clientCertificateRequired: false, enabledSslProtocols: SslProtocols.Tls13 | SslProtocols.Tls12, checkCertificateRevocation: false);
+                    stream = sslStream;
+                }
+                await WriteErrorAsync(stream, HttpStatusCode.ServiceUnavailable, "服务繁忙，请稍后重试。");
+            }
+            catch
+            {
+                // 客户端可能已断开
+            }
+        }
         return;
     }
 
@@ -415,10 +384,6 @@ static async Task HandleClientAsync(TcpClient client, ServerSettings settings, s
         {
             if (serverCert is not null)
             {
-                // SEC-6 FIX: 为 TLS 握手添加显式超时保护
-                using var tlsTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, tlsTimeoutCts.Token);
-
                 var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
                 await sslStream.AuthenticateAsServerAsync(serverCert, clientCertificateRequired: false, enabledSslProtocols: SslProtocols.Tls13 | SslProtocols.Tls12, checkCertificateRevocation: false);
                 stream = sslStream;
@@ -427,14 +392,9 @@ static async Task HandleClientAsync(TcpClient client, ServerSettings settings, s
             var request = await ReadHttpRequestAsync(stream, ct);
             await HandleRequestAsync(stream, request, settings, runtimeDir, frpsStartedByServer, allocatedPorts, allocatedPortsLock, tlsMode, tlsFingerprint);
         }
-        catch (AuthenticationException)
+        catch (AuthenticationException ex)
         {
-            // SEC-10 FIX: 不暴露协议细节
-            Console.Error.WriteLine("[连接失败] TLS 握手失败。");
-        }
-        catch (OperationCanceledException)
-        {
-            Console.Error.WriteLine("[连接超时] TLS 握手或请求处理超时。");
+            Console.Error.WriteLine($"[TLS 握手失败] {ex.Message} 客户端可能使用了错误的协议 (HTTP vs HTTPS)。");
         }
         catch (Exception ex)
         {

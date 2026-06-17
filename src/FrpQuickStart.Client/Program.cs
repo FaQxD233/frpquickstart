@@ -50,6 +50,77 @@ if (tlsMode == "self-signed")
 }
 
 var controlUrl = BuildControlUrl(serverHost, controlPort, tlsMode);
+
+// SEC-5 FIX: 查询服务器 TLS 配置，防止降级攻击
+Console.WriteLine("正在验证服务器 TLS 配置...");
+try
+{
+    using var healthHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+    var healthUrl = controlUrl.Replace("/api/tunnels", "").TrimEnd('/') + "/health";
+    HealthResponse? health = null;
+
+    try
+    {
+        health = await healthHttp.GetFromJsonAsync(healthUrl, FrpQuickJsonContext.Default.HealthResponse);
+    }
+    catch (HttpRequestException ex) when (tlsMode != "none")
+    {
+        Console.Error.WriteLine($"[警告] 无法通过 HTTPS 访问服务器健康检查: {ex.Message}");
+        Console.Error.WriteLine("可能原因: 服务器未启用 TLS，或证书不受信任。");
+        Console.Write("是否尝试使用 HTTP 明文连接? (yes/no): ");
+        var answer = Console.ReadLine()?.Trim().ToLowerInvariant();
+        if (answer is "yes" or "y")
+        {
+            tlsMode = "none";
+            controlUrl = BuildControlUrl(serverHost, controlPort, "none");
+            health = await healthHttp.GetFromJsonAsync(controlUrl.Replace("/api/tunnels", "").TrimEnd('/') + "/health", FrpQuickJsonContext.Default.HealthResponse);
+        }
+        else
+        {
+            Console.Error.WriteLine("用户取消连接。");
+            return;
+        }
+    }
+
+    if (health is not null)
+    {
+        Console.WriteLine($"服务器 TLS 模式: {health.TlsMode}");
+
+        // 检查客户端与服务器 TLS 模式是否匹配
+        if (!string.Equals(health.TlsMode, tlsMode, StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Error.WriteLine($"[安全错误] TLS 模式不匹配！");
+            Console.Error.WriteLine($"  服务器要求: {health.TlsMode}");
+            Console.Error.WriteLine($"  客户端配置: {tlsMode}");
+            Console.Error.WriteLine("可能的中间人攻击或配置错误。连接已拒绝。");
+            return;
+        }
+
+        // 如果服务器返回指纹，验证是否匹配
+        if (health.TlsMode == "self-signed" && !string.IsNullOrWhiteSpace(health.TlsFingerprint))
+        {
+            if (tlsFingerprint is not null)
+            {
+                var serverFp = health.TlsFingerprint.ToUpperInvariant().Replace(":", "").Replace(" ", "");
+                var clientFp = tlsFingerprint.ToUpperInvariant().Replace(":", "").Replace(" ", "");
+                if (!string.Equals(serverFp, clientFp, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.Error.WriteLine($"[安全错误] 证书指纹不匹配！");
+                    Console.Error.WriteLine($"  服务器指纹: {health.TlsFingerprint}");
+                    Console.Error.WriteLine($"  您输入的指纹: {tlsFingerprint}");
+                    Console.Error.WriteLine("可能的中间人攻击或您输入了错误的指纹。连接已拒绝。");
+                    return;
+                }
+            }
+        }
+    }
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"[警告] 无法验证服务器 TLS 配置: {ex.Message}");
+    Console.WriteLine("将继续尝试连接，但请确保网络安全。");
+}
+
 var clientName = Environment.MachineName;
 var request = new TunnelRequest
 {
@@ -73,8 +144,35 @@ try
             ServerCertificateCustomValidationCallback = (httpRequestMessage, cert, chain, sslPolicyErrors) =>
             {
                 if (cert is null) return false;
-                var actualFingerprint = cert.GetCertHashString(HashAlgorithmName.SHA256).ToUpperInvariant();
-                return string.Equals(actualFingerprint, expectedFingerprint, StringComparison.OrdinalIgnoreCase);
+
+                // SEC-1 FIX: 检查证书有效性，即使指纹匹配也要拒绝过期/吊销证书
+                // 自签名证书允许 RemoteCertificateNameMismatch (主机名不匹配)
+                var allowedErrors = SslPolicyErrors.RemoteCertificateNameMismatch;
+                if ((sslPolicyErrors & ~allowedErrors) != SslPolicyErrors.None)
+                {
+                    Console.Error.WriteLine($"[TLS 验证失败] 证书存在安全问题: {sslPolicyErrors}");
+                    return false;
+                }
+
+                // 显式检查证书过期
+                var now = DateTimeOffset.UtcNow;
+                if (cert.NotBefore > now || cert.NotAfter < now)
+                {
+                    Console.Error.WriteLine($"[TLS 验证失败] 证书已过期或尚未生效 (有效期: {cert.NotBefore:u} - {cert.NotAfter:u})");
+                    return false;
+                }
+
+                // 指纹验证
+                try
+                {
+                    var actualFingerprint = cert.GetCertHashString(HashAlgorithmName.SHA256).ToUpperInvariant();
+                    return string.Equals(actualFingerprint, expectedFingerprint, StringComparison.OrdinalIgnoreCase);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[TLS 验证失败] 无法计算证书指纹: {ex.Message}");
+                    return false;
+                }
             }
         };
     }

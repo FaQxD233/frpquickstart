@@ -19,5 +19,5 @@ if ($LASTEXITCODE -ne 0) {
 Get-ChildItem -Path (Join-Path $outRoot "client") -Filter *.pdb -ErrorAction SilentlyContinue | Remove-Item -Force
 
 Write-Host "Windows client published to $outRoot\client"
-Write-Host "Put frpc.exe in the same folder before sending it to users."
+Write-Host "frpc.exe is embedded in frpquick-client.exe and will be extracted automatically on first run."
 Write-Host "The client exe is self-contained; .NET Runtime is not required on the target Windows machine."

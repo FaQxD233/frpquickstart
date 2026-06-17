@@ -5,12 +5,18 @@
 - `frpquick-server`: 跑在 Ubuntu 服务器上，启动/管理 `frps`，接收 Windows 客户端发来的穿透请求。
 - `frpquick-client`: 跑在 Windows 朋友电脑上，按提示输入服务器和本地服务信息，自动生成 `frpc` 配置并启动 `frpc`。
 
+## 内置 frp
+
+发布产物默认内置 frp `v0.69.1`：
+
+- Windows 客户端内置 `frpc.exe`
+- 服务端内置 Linux x64 `frps`，并额外内置 Windows x64 `frps.exe` 方便本机调试
+
+首次运行时程序会把对应二进制释放到 `runtime/frp/`，用户不需要单独下载 frp。高级用法仍可通过 `--frpc <路径>` 或 `server-config.json` 里的 `FrpsPath` 指定自己的 frp 二进制。
+
 ## 需要准备
 
-1. 从 frp 官方 Release 下载对应平台的二进制文件。
-2. Ubuntu 端把 `frps` 放到 `frpquick-server` 同目录，或加入 `PATH`。
-3. Windows 端把 `frpc.exe` 放到 `frpquick-client.exe` 同目录，或加入 `PATH`。
-4. Ubuntu 防火墙/云安全组放行：
+Ubuntu 防火墙/云安全组放行：
    - 控制服务端口，默认 `9080/tcp`
    - frps 端口，默认 `7000/tcp`
    - 你要暴露给外网访问的公网端口，例如 `25565/tcp`
@@ -20,7 +26,7 @@
 首次运行：
 
 ```bash
-chmod +x frpquick-server frps
+chmod +x frpquick-server
 ./frpquick-server
 ```
 
@@ -95,6 +101,8 @@ Linux x64：
 
 - Windows: `artifacts/win-x64-self-contained/client/frpquick-client.exe`
 - Ubuntu Linux: `artifacts/linux-x64-self-contained/server/frpquick-server`
+
+这两个可执行文件都已经包含对应 frp 组件，分发时不需要额外附带 `frpc.exe` 或 `frps`。
 
 ## 注意
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-OUT="$ROOT/artifacts/linux-x64/server"
+OUT="$ROOT/artifacts/linux-x64-self-contained/server"
 
 dotnet publish "$ROOT/src/FrpQuickStart.Server/FrpQuickStart.Server.csproj" \
   -c Release \
@@ -18,5 +18,5 @@ dotnet publish "$ROOT/src/FrpQuickStart.Server/FrpQuickStart.Server.csproj" \
 find "$OUT" -maxdepth 1 -name '*.pdb' -type f -delete
 
 echo "Linux server published to $OUT"
-echo "Put frps in the same folder before deploying it to Ubuntu."
+echo "frps is embedded in frpquick-server and will be extracted automatically on first run."
 echo "The server binary is self-contained; .NET Runtime is not required on the target Ubuntu machine."
