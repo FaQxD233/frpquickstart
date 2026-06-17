@@ -52,6 +52,7 @@ public sealed class TunnelRecord
     public int LocalPort { get; set; }
     public string ClientName { get; set; } = "";
     public string ProxyName { get; set; } = "";
+    public bool IsOnline { get; set; }
 }
 
 public sealed class TunnelListResponse

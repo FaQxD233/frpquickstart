@@ -14,6 +14,10 @@ if (args.Contains("--help", StringComparer.OrdinalIgnoreCase))
 }
 
 Console.OutputEncoding = Encoding.UTF8;
+
+// 设置窗口标题
+Console.Title = "FRP QuickStart Client";
+
 Console.WriteLine("FRP QuickStart Windows Client");
 Console.WriteLine("请按提示填写 Ubuntu 服务器和本地服务信息。");
 Console.WriteLine();
@@ -264,6 +268,9 @@ Console.WriteLine("隧道配置已生成:");
 Console.WriteLine($"  {frpcConfigPath}");
 Console.WriteLine($"公网访问地址: {frpServerAddress}:{response.RemotePort}");
 Console.WriteLine("正在启动 frpc，保持此窗口打开即可保持穿透在线。按 Ctrl+C 停止。");
+
+// 更新窗口标题显示端口信息
+Console.Title = $"FRP Client - 端口 {response.RemotePort} [{protocol.ToUpper()}]";
 
 Process? frpcProcess;
 try

@@ -970,7 +970,12 @@ static async Task ServeTunnelsList(Stream responseStream, string runtimeDir)
             try
             {
                 var record = JsonSerializer.Deserialize(line, FrpQuickJsonContext.Default.TunnelRecord);
-                if (record != null) tunnels.Add(record);
+                if (record != null)
+                {
+                    // 检测端口是否在线
+                    record.IsOnline = IsPortListening(record.RemotePort);
+                    tunnels.Add(record);
+                }
             }
             catch { /* 跳过损坏的行 */ }
         }
@@ -984,6 +989,31 @@ static async Task ServeTunnelsList(Stream responseStream, string runtimeDir)
         Success = true,
         Tunnels = tunnels
     }, FrpQuickJsonContext.Default.TunnelListResponse);
+}
+
+static bool IsPortListening(int port)
+{
+    try
+    {
+        // 检查端口是否被监听（frps 在监听表示隧道在线）
+        var endpoint = new System.Net.IPEndPoint(System.Net.IPAddress.Any, port);
+        using var socket = new System.Net.Sockets.Socket(endpoint.AddressFamily, System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
+        try
+        {
+            socket.Bind(endpoint);
+            // 可以绑定说明没被占用，隧道离线
+            return false;
+        }
+        catch (System.Net.Sockets.SocketException)
+        {
+            // 绑定失败说明端口被占用，隧道在线
+            return true;
+        }
+    }
+    catch
+    {
+        return false;
+    }
 }
 
 static async Task ServeStats(Stream responseStream, string runtimeDir, HashSet<int> allocatedPorts, object allocatedPortsLock)
@@ -1140,6 +1170,13 @@ static string GetAdminPageHtml()
             background: #fff3e0;
             color: #f57c00;
         }
+        .status-online {
+            color: #4caf50;
+            font-weight: bold;
+        }
+        .status-offline {
+            color: #9e9e9e;
+        }
         .loading {
             text-align: center;
             padding: 40px;
@@ -1225,6 +1262,7 @@ static string GetAdminPageHtml()
                 table.innerHTML = `
                     <thead>
                         <tr>
+                            <th>状态</th>
                             <th>客户端名称</th>
                             <th>协议</th>
                             <th>本地地址</th>
@@ -1236,6 +1274,9 @@ static string GetAdminPageHtml()
                     <tbody>
                         ${tunnelsData.Tunnels.map(t => `
                             <tr>
+                                <td class="${t.IsOnline ? 'status-online' : 'status-offline'}">
+                                    ${t.IsOnline ? '🟢 在线' : '🔴 离线'}
+                                </td>
                                 <td><strong>${escapeHtml(t.ClientName)}</strong></td>
                                 <td><span class="badge badge-${t.Protocol.toLowerCase()}">${t.Protocol.toUpperCase()}</span></td>
                                 <td>${escapeHtml(t.LocalIp)}:${t.LocalPort}</td>
