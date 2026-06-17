@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Security;
@@ -74,7 +75,7 @@ if (tlsMode is not "none" and not "self-signed" and not "acme")
     return;
 }
 
-X509Certificate2? serverCert = null;
+TlsCertificateProvider? tlsCertificateProvider = null;
 string? tlsFingerprint = null;
 
 if (tlsMode == "self-signed")
@@ -92,64 +93,36 @@ if (tlsMode == "self-signed")
         }
 
         var password = File.ReadAllText(passwordPath, Encoding.UTF8).Trim();
-        serverCert = X509CertificateLoader.LoadPkcs12FromFile(certPath, password);
+        var serverCert = X509CertificateLoader.LoadPkcs12FromFile(certPath, password);
+        tlsCertificateProvider = TlsCertificateProvider.FromCertificate(serverCert);
         Console.WriteLine($"TLS: 加载已有自签证书 {certPath}");
     }
     else
     {
-        serverCert = GenerateSelfSignedCert(settings, certPath);
+        var serverCert = GenerateSelfSignedCert(settings, certPath);
+        tlsCertificateProvider = TlsCertificateProvider.FromCertificate(serverCert);
         Console.WriteLine($"TLS: 已生成自签证书并保存到 {certPath}");
     }
-    tlsFingerprint = serverCert.GetCertHashString(HashAlgorithmName.SHA256);
+    tlsFingerprint = tlsCertificateProvider.Fingerprint;
     Console.WriteLine($"TLS 证书指纹 (SHA256): {tlsFingerprint}");
     Console.WriteLine("请将此指纹告知 Windows 客户端用户，客户端需要该指纹验证证书。");
 }
 else if (tlsMode == "acme")
 {
-    var certPath = GetOption(args, "--tls-cert") ?? settings.TlsCertPath;
-    var keyPath = GetOption(args, "--tls-key") ?? settings.TlsKeyPath;
-
-    if (string.IsNullOrWhiteSpace(certPath) || string.IsNullOrWhiteSpace(keyPath))
-    {
-        Console.Error.WriteLine("acme 模式需要指定证书和私钥路径。使用 --tls-cert 和 --tls-key 参数，或在 server-config.json 中设置 TlsCertPath 和 TlsKeyPath。");
-        return;
-    }
-
-    // SEC-4 FIX: 路径遍历漏洞防护
+    AcmeCertificatePaths acmePaths;
     try
     {
-        certPath = Path.GetFullPath(certPath);
-        keyPath = Path.GetFullPath(keyPath);
-        var allowedDir = Path.GetFullPath(runtimeDir);
-
-        if (!certPath.StartsWith(allowedDir, StringComparison.OrdinalIgnoreCase) ||
-            !keyPath.StartsWith(allowedDir, StringComparison.OrdinalIgnoreCase))
-        {
-            Console.Error.WriteLine($"[安全错误] 证书路径必须在 {allowedDir} 目录内。");
-            Console.Error.WriteLine($"  证书路径: {certPath}");
-            Console.Error.WriteLine($"  密钥路径: {keyPath}");
-            return;
-        }
+        acmePaths = await EnsureAcmeCertificateAsync(settings, runtimeDir, args);
     }
     catch (Exception ex)
     {
-        Console.Error.WriteLine($"[错误] 证书路径无效: {ex.Message}");
+        Console.Error.WriteLine($"[错误] ACME 证书准备失败: {ex.Message}");
         return;
     }
 
-    if (!File.Exists(certPath))
-    {
-        Console.Error.WriteLine($"TLS 证书文件不存在: {certPath}");
-        return;
-    }
-    if (!File.Exists(keyPath))
-    {
-        Console.Error.WriteLine($"TLS 私钥文件不存在: {keyPath}");
-        return;
-    }
-
-    serverCert = X509Certificate2.CreateFromPemFile(certPath, keyPath);
-    Console.WriteLine($"TLS: 加载 acme 证书 {certPath}");
+    tlsCertificateProvider = TlsCertificateProvider.FromPemFiles(acmePaths.FullChainPath, acmePaths.KeyPath);
+    var serverCert = tlsCertificateProvider.CurrentCertificate;
+    Console.WriteLine($"TLS: 加载 acme fullchain 证书 {acmePaths.FullChainPath}");
 
     // SEC-9 FIX: 证书过期时拒绝启动，即将过期时警告
     if (serverCert.NotAfter < DateTimeOffset.UtcNow)
@@ -162,6 +135,7 @@ else if (tlsMode == "acme")
         Console.WriteLine($"[警告] TLS 证书将在 7 天内过期 ({serverCert.NotAfter:u})，请及时续期。");
     }
     Console.WriteLine("acme 证书由公共 CA 签发，客户端无需额外配置即可信任。");
+    Console.WriteLine("acme.sh 续期后会覆盖 runtime/acme 下的证书文件；服务端会在新连接握手前自动重新加载。");
 }
 
 var protocolPrefix = tlsMode == "none" ? "http" : "https";
@@ -245,7 +219,7 @@ while (!frpsMonitorCts.Token.IsCancellationRequested)
         break;
     }
 
-    _ = Task.Run(() => HandleClientAsync(client, settings, runtimeDir, frpsProcess is not null, allocatedPorts, allocatedPortsLock, concurrencySemaphore, frpsMonitorCts.Token, serverCert, tlsMode, tlsFingerprint));
+    _ = Task.Run(() => HandleClientAsync(client, settings, runtimeDir, frpsProcess is not null, allocatedPorts, allocatedPortsLock, concurrencySemaphore, frpsMonitorCts.Token, tlsCertificateProvider, tlsMode, tlsFingerprint));
 }
 
 StopChild(frpsProcess);
@@ -376,6 +350,273 @@ static X509Certificate2 GenerateSelfSignedCert(ServerSettings settings, string s
     return X509CertificateLoader.LoadPkcs12(pfxBytes, password);
 }
 
+static async Task<AcmeCertificatePaths> EnsureAcmeCertificateAsync(ServerSettings settings, string runtimeDir, string[] args)
+{
+    if (OperatingSystem.IsWindows())
+    {
+        throw new InvalidOperationException("acme 模式当前依赖 acme.sh，请在 Linux/Ubuntu 服务端运行。");
+    }
+
+    var acmeDir = Path.Combine(runtimeDir, "acme");
+    Directory.CreateDirectory(acmeDir);
+
+    var fullChainPath = GetOption(args, "--tls-cert") ?? settings.TlsCertPath;
+    if (string.IsNullOrWhiteSpace(fullChainPath))
+    {
+        fullChainPath = Path.Combine(acmeDir, "fullchain.pem");
+    }
+
+    var keyPath = GetOption(args, "--tls-key") ?? settings.TlsKeyPath;
+    if (string.IsNullOrWhiteSpace(keyPath))
+    {
+        keyPath = Path.Combine(acmeDir, "key.pem");
+    }
+
+    var leafCertPath = Path.Combine(acmeDir, "cert.pem");
+    fullChainPath = ResolveRuntimeFilePath(fullChainPath, runtimeDir, "证书路径");
+    keyPath = ResolveRuntimeFilePath(keyPath, runtimeDir, "私钥路径");
+    leafCertPath = ResolveRuntimeFilePath(leafCertPath, runtimeDir, "证书路径");
+
+    var identifier = GetOption(args, "--acme-id") ?? settings.AcmeIdentifier;
+    if (string.IsNullOrWhiteSpace(identifier))
+    {
+        identifier = settings.PublicAddress;
+    }
+
+    identifier = identifier.Trim();
+    if (string.IsNullOrWhiteSpace(identifier))
+    {
+        throw new InvalidOperationException("acme 模式需要 ACME 标识符。请设置 PublicAddress、AcmeIdentifier，或传入 --acme-id <公网IP>。");
+    }
+
+    if (!IPAddress.TryParse(identifier, out _) && !IsValidHost(identifier))
+    {
+        throw new InvalidOperationException($"ACME 标识符无效: {identifier}");
+    }
+
+    var acmeShPath = ResolveAcmeShPath(GetOption(args, "--acme-sh") ?? settings.AcmeShPath);
+    var renewDays = GetIntOption(args, "--acme-renew-days") ?? settings.AcmeRenewDays;
+    if (renewDays < 1)
+    {
+        throw new InvalidOperationException("AcmeRenewDays 必须大于 0。");
+    }
+
+    var server = (HasFlag(args, "--acme-staging") || settings.AcmeStaging) ? "letsencrypt_test" : "letsencrypt";
+    var profile = GetOption(args, "--acme-profile") ?? settings.AcmeProfile;
+    var keyLength = GetOption(args, "--acme-key-length") ?? settings.AcmeKeyLength;
+    var email = GetOption(args, "--acme-email") ?? settings.AcmeAccountEmail;
+
+    Console.WriteLine($"ACME: 使用 acme.sh 为 {identifier} 申请/续期 Let's Encrypt 证书。");
+    Console.WriteLine($"ACME: 输出 fullchain={fullChainPath}, key={keyPath}, renewDays={renewDays}, server={server}");
+    if (!string.IsNullOrWhiteSpace(profile))
+    {
+        Console.WriteLine($"ACME: 请求证书 profile={profile}");
+    }
+    if (!string.IsNullOrWhiteSpace(keyLength))
+    {
+        Console.WriteLine($"ACME: 请求证书 keyLength={keyLength}");
+    }
+
+    var issueArgs = new List<string>
+    {
+        "--issue",
+        "--standalone",
+        "--server", server,
+        "-d", identifier,
+        "--days", renewDays.ToString(System.Globalization.CultureInfo.InvariantCulture)
+    };
+
+    if (!string.IsNullOrWhiteSpace(keyLength))
+    {
+        issueArgs.Add("--keylength");
+        issueArgs.Add(keyLength.Trim());
+    }
+
+    if (!string.IsNullOrWhiteSpace(profile))
+    {
+        issueArgs.Add("--cert-profile");
+        issueArgs.Add(profile.Trim());
+    }
+
+    if (!string.IsNullOrWhiteSpace(email))
+    {
+        issueArgs.Add("-m");
+        issueArgs.Add(email.Trim());
+    }
+
+    await RunAcmeShAsync(acmeShPath, issueArgs, TimeSpan.FromMinutes(5), required: true);
+
+    var installArgs = new List<string>
+    {
+        "--install-cert",
+        "-d", identifier,
+        "--cert-file", leafCertPath,
+        "--key-file", keyPath,
+        "--fullchain-file", fullChainPath
+    };
+    await RunAcmeShAsync(acmeShPath, installArgs, TimeSpan.FromMinutes(2), required: true);
+
+    await RunAcmeShAsync(acmeShPath, new[] { "--install-cronjob" }, TimeSpan.FromMinutes(1), required: false);
+
+    if (!File.Exists(fullChainPath))
+    {
+        throw new InvalidOperationException($"acme.sh 未生成 fullchain 文件: {fullChainPath}");
+    }
+
+    if (!File.Exists(keyPath))
+    {
+        throw new InvalidOperationException($"acme.sh 未生成私钥文件: {keyPath}");
+    }
+
+    if (!OperatingSystem.IsWindows())
+    {
+        File.SetUnixFileMode(fullChainPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        File.SetUnixFileMode(keyPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        if (File.Exists(leafCertPath))
+        {
+            File.SetUnixFileMode(leafCertPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+    }
+
+    return new AcmeCertificatePaths(fullChainPath, keyPath);
+}
+
+static string ResolveRuntimeFilePath(string path, string runtimeDir, string description)
+{
+    try
+    {
+        var fullPath = Path.GetFullPath(path);
+        var allowedDir = Path.GetFullPath(runtimeDir);
+
+        if (!IsPathInsideDirectory(fullPath, allowedDir))
+        {
+            throw new InvalidOperationException($"{description}必须在 {allowedDir} 目录内: {fullPath}");
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+        return fullPath;
+    }
+    catch (InvalidOperationException)
+    {
+        throw;
+    }
+    catch (Exception ex)
+    {
+        throw new InvalidOperationException($"{description}无效: {ex.Message}", ex);
+    }
+}
+
+static bool IsPathInsideDirectory(string path, string directory)
+{
+    var relative = Path.GetRelativePath(directory, path);
+    return relative != "." &&
+        relative != ".." &&
+        !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) &&
+        !relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal) &&
+        !Path.IsPathRooted(relative);
+}
+
+static string ResolveAcmeShPath(string configuredPath)
+{
+    var path = ExpandHomeDirectory(string.IsNullOrWhiteSpace(configuredPath) ? "~/.acme.sh/acme.sh" : configuredPath.Trim());
+    if (Path.IsPathRooted(path) || path.Contains(Path.DirectorySeparatorChar) || path.Contains(Path.AltDirectorySeparatorChar))
+    {
+        path = Path.GetFullPath(path);
+        if (!File.Exists(path))
+        {
+            throw new InvalidOperationException($"找不到 acme.sh: {path}。请先安装 acme.sh，或通过 AcmeShPath/--acme-sh 指定路径。");
+        }
+    }
+
+    return path;
+}
+
+static string ExpandHomeDirectory(string path)
+{
+    if (path == "~")
+    {
+        return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    }
+
+    if (path.StartsWith("~/", StringComparison.Ordinal) || path.StartsWith("~\\", StringComparison.Ordinal))
+    {
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), path[2..]);
+    }
+
+    return path;
+}
+
+static async Task RunAcmeShAsync(string acmeShPath, IReadOnlyCollection<string> arguments, TimeSpan timeout, bool required)
+{
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = acmeShPath,
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        CreateNoWindow = true
+    };
+
+    foreach (var argument in arguments)
+    {
+        startInfo.ArgumentList.Add(argument);
+    }
+
+    Console.WriteLine($"ACME: 执行 {acmeShPath} {string.Join(' ', arguments.Select(EscapeForLog))}");
+
+    using var process = new Process { StartInfo = startInfo };
+    try
+    {
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("进程未能启动。");
+        }
+    }
+    catch (Win32Exception ex)
+    {
+        throw new InvalidOperationException($"无法启动 acme.sh: {ex.Message}", ex);
+    }
+
+    var stdoutTask = process.StandardOutput.ReadToEndAsync();
+    var stderrTask = process.StandardError.ReadToEndAsync();
+    var exitTask = process.WaitForExitAsync();
+    var completed = await Task.WhenAny(exitTask, Task.Delay(timeout));
+    if (completed != exitTask)
+    {
+        try { process.Kill(entireProcessTree: true); } catch { /* ignore */ }
+        throw new InvalidOperationException($"acme.sh 执行超时: {string.Join(' ', arguments.Select(EscapeForLog))}");
+    }
+
+    var stdout = (await stdoutTask).Trim();
+    var stderr = (await stderrTask).Trim();
+    if (!string.IsNullOrWhiteSpace(stdout))
+    {
+        Console.WriteLine(stdout);
+    }
+
+    if (process.ExitCode != 0)
+    {
+        var message = $"acme.sh 退出码 {process.ExitCode}: {stderr}";
+        if (required)
+        {
+            throw new InvalidOperationException(message);
+        }
+
+        Console.WriteLine($"[警告] {message}");
+        return;
+    }
+
+    if (!string.IsNullOrWhiteSpace(stderr))
+    {
+        Console.WriteLine(stderr);
+    }
+}
+
+static string EscapeForLog(string value)
+{
+    return value.Any(char.IsWhiteSpace) ? "\"" + value.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"" : value;
+}
+
 // ROB-3: frps 进程监控，退出时打印警告
 static async Task MonitorFrpsAsync(Process frpsProcess, CancellationToken ct)
 {
@@ -394,7 +635,7 @@ static async Task MonitorFrpsAsync(Process frpsProcess, CancellationToken ct)
     }
 }
 
-static async Task HandleClientAsync(TcpClient client, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock, SemaphoreSlim concurrencySemaphore, CancellationToken ct, X509Certificate2? serverCert, string tlsMode, string? tlsFingerprint)
+static async Task HandleClientAsync(TcpClient client, ServerSettings settings, string runtimeDir, bool frpsStartedByServer, HashSet<int> allocatedPorts, object allocatedPortsLock, SemaphoreSlim concurrencySemaphore, CancellationToken ct, TlsCertificateProvider? tlsCertificateProvider, string tlsMode, string? tlsFingerprint)
 {
     // SEC-3 FIX: 在 TLS 握手前检查并发限制，避免浪费资源
     if (!await concurrencySemaphore.WaitAsync(5000, ct))
@@ -413,14 +654,14 @@ static async Task HandleClientAsync(TcpClient client, ServerSettings settings, s
         Stream stream = client.GetStream();
         try
         {
-            if (serverCert is not null)
+            if (tlsCertificateProvider is not null)
             {
                 // SEC-6 FIX: 为 TLS 握手添加显式超时保护
                 using var tlsTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, tlsTimeoutCts.Token);
 
                 var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
-                await sslStream.AuthenticateAsServerAsync(serverCert, clientCertificateRequired: false, enabledSslProtocols: SslProtocols.Tls13 | SslProtocols.Tls12, checkCertificateRevocation: false);
+                await sslStream.AuthenticateAsServerAsync(tlsCertificateProvider.CreateAuthenticationOptions(), linkedCts.Token);
                 stream = sslStream;
             }
 
@@ -480,6 +721,12 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
         // GET /admin - 管理界面
         if (httpRequest.Method == "GET" && httpRequest.Path == "/admin")
         {
+            if (!IsAdminAuthorized(httpRequest, settings))
+            {
+                await ServeAdminLoginPage(responseStream);
+                return;
+            }
+
             await ServeAdminPage(responseStream);
             return;
         }
@@ -487,6 +734,12 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
         // GET /api/tunnels/list - 获取隧道列表
         if (httpRequest.Method == "GET" && httpRequest.Path == "/api/tunnels/list")
         {
+            if (!IsAdminAuthorized(httpRequest, settings))
+            {
+                await WriteErrorAsync(responseStream, HttpStatusCode.Unauthorized, "未授权。");
+                return;
+            }
+
             await ServeTunnelsList(responseStream, runtimeDir);
             return;
         }
@@ -494,6 +747,12 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
         // GET /api/stats - 统计信息
         if (httpRequest.Method == "GET" && httpRequest.Path == "/api/stats")
         {
+            if (!IsAdminAuthorized(httpRequest, settings))
+            {
+                await WriteErrorAsync(responseStream, HttpStatusCode.Unauthorized, "未授权。");
+                return;
+            }
+
             await ServeStats(responseStream, runtimeDir, allocatedPorts, allocatedPortsLock);
             return;
         }
@@ -682,6 +941,50 @@ static bool FixedTimeEquals(string left, string right)
     return CryptographicOperations.FixedTimeEquals(leftBytes, rightBytes);
 }
 
+static bool IsAdminAuthorized(SimpleHttpRequest request, ServerSettings settings)
+{
+    var suppliedSecret = GetQueryParameter(request.QueryString, "secret");
+    if (string.IsNullOrWhiteSpace(suppliedSecret) &&
+        request.Headers.TryGetValue("X-Api-Secret", out var headerSecret))
+    {
+        suppliedSecret = headerSecret;
+    }
+
+    if (string.IsNullOrWhiteSpace(suppliedSecret) &&
+        request.Headers.TryGetValue("Authorization", out var authorization) &&
+        authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+    {
+        suppliedSecret = authorization["Bearer ".Length..].Trim();
+    }
+
+    return !string.IsNullOrEmpty(suppliedSecret) && FixedTimeEquals(suppliedSecret, settings.ApiSecret);
+}
+
+static string? GetQueryParameter(string queryString, string name)
+{
+    if (string.IsNullOrWhiteSpace(queryString))
+    {
+        return null;
+    }
+
+    var query = queryString.StartsWith("?", StringComparison.Ordinal) ? queryString[1..] : queryString;
+    foreach (var part in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
+    {
+        var pair = part.Split('=', 2);
+        var key = Uri.UnescapeDataString(pair[0].Replace("+", " ", StringComparison.Ordinal));
+        if (!string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
+        {
+            continue;
+        }
+
+        return pair.Length == 2
+            ? Uri.UnescapeDataString(pair[1].Replace("+", " ", StringComparison.Ordinal))
+            : "";
+    }
+
+    return null;
+}
+
 static void AppendTunnelRecord(string runtimeDir, TunnelRequest request, string proxyName)
 {
     // ROB-9 FIX: 使用命名类型代替匿名类型以支持 trimming
@@ -781,6 +1084,7 @@ static async Task<SimpleHttpRequest> ReadHttpRequestAsync(Stream stream, Cancell
     }
 
     var contentLength = 0;
+    var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     for (var i = 1; i < lines.Length; i++)
     {
         var separator = lines[i].IndexOf(':');
@@ -791,6 +1095,7 @@ static async Task<SimpleHttpRequest> ReadHttpRequestAsync(Stream stream, Cancell
 
         var name = lines[i][..separator].Trim();
         var value = lines[i][(separator + 1)..].Trim();
+        headers[name] = value;
         if (string.Equals(name, "Content-Length", StringComparison.OrdinalIgnoreCase) &&
             int.TryParse(value, out var parsed))
         {
@@ -823,8 +1128,10 @@ static async Task<SimpleHttpRequest> ReadHttpRequestAsync(Stream stream, Cancell
         offset += read;
     }
 
-    var path = requestParts[1].Split('?', 2)[0];
-    return new SimpleHttpRequest(requestParts[0].ToUpperInvariant(), path, body);
+    var targetParts = requestParts[1].Split('?', 2);
+    var path = targetParts[0];
+    var queryString = targetParts.Length == 2 ? targetParts[1] : "";
+    return new SimpleHttpRequest(requestParts[0].ToUpperInvariant(), path, queryString, headers, body);
 }
 
 static int IndexOfHeaderEnd(List<byte> bytes)
@@ -869,6 +1176,7 @@ static string ReasonPhrase(HttpStatusCode statusCode)
     {
         HttpStatusCode.OK => "OK",
         HttpStatusCode.BadRequest => "Bad Request",
+        HttpStatusCode.Unauthorized => "Unauthorized",
         HttpStatusCode.NotFound => "Not Found",
         HttpStatusCode.Conflict => "Conflict",
         HttpStatusCode.ServiceUnavailable => "Service Unavailable",
@@ -902,6 +1210,27 @@ static string? GetOption(string[] args, string name)
     return null;
 }
 
+static int? GetIntOption(string[] args, string name)
+{
+    var value = GetOption(args, name);
+    if (value is null)
+    {
+        return null;
+    }
+
+    if (int.TryParse(value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed))
+    {
+        return parsed;
+    }
+
+    throw new InvalidOperationException($"{name} 必须是整数。");
+}
+
+static bool HasFlag(string[] args, string name)
+{
+    return args.Any(arg => string.Equals(arg, name, StringComparison.OrdinalIgnoreCase));
+}
+
 static void StopChild(Process? process)
 {
     if (process is null || process.HasExited)
@@ -928,8 +1257,15 @@ static void PrintHelp()
     选项:
       --config <path>           配置文件路径，默认 server-config.json
       --tls <mode>              TLS 模式: none (默认) / self-signed / acme
-      --tls-cert <path>         TLS 证书路径 (acme 模式)
-      --tls-key <path>          TLS 私钥路径 (acme 模式)
+      --tls-cert <path>         ACME fullchain 输出路径，默认 runtime/acme/fullchain.pem
+      --tls-key <path>          ACME 私钥输出路径，默认 runtime/acme/key.pem
+      --acme-id <ip-or-host>    ACME 标识符，IP 证书填写公网 IP；默认使用 PublicAddress
+      --acme-email <email>      ACME 账户邮箱
+      --acme-sh <path>          acme.sh 路径，默认 ~/.acme.sh/acme.sh
+      --acme-renew-days <days>  acme.sh 续期间隔，默认 7
+      --acme-profile <profile>  ACME cert profile，默认 shortlived；设为空可禁用
+      --acme-key-length <value>  ACME 密钥长度/类型，默认 2048；可用 ec-256 等
+      --acme-staging           使用 Let's Encrypt staging 环境测试
 
     首次启动会生成 server-config.json，并打印 API 密钥。
     默认使用内置 frps；如需覆盖，请修改 server-config.json 的 FrpsPath。
@@ -937,7 +1273,7 @@ static void PrintHelp()
     TLS 模式:
       none        - 明文 HTTP，仅限受信网络/内网使用
       self-signed - 自动生成自签证书，打印指纹供客户端验证
-      acme        - 使用 acme.sh 获取的 Let's Encrypt IP 证书 (公网信任)
+      acme        - 调用 acme.sh 获取 Let's Encrypt shortlived IP 证书 (公网信任)
 
     安全提示: 使用 TLS 加密可防止密钥和 FrpAuthToken 被中间人窃取。
     """);
@@ -953,6 +1289,64 @@ static async Task ServeAdminPage(Stream responseStream)
     var headerBytes = Encoding.UTF8.GetBytes(headers);
 
     await responseStream.WriteAsync(headerBytes);
+    await responseStream.WriteAsync(bytes);
+    await responseStream.FlushAsync();
+}
+
+static async Task ServeAdminLoginPage(Stream responseStream)
+{
+    var html = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FRP QuickStart 管理面板</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f7fb; color: #202124; }
+        main { width: min(420px, calc(100vw - 32px)); background: #fff; border: 1px solid #dfe3ea; border-radius: 8px; padding: 28px; box-shadow: 0 10px 30px rgba(20, 30, 50, 0.08); }
+        h1 { font-size: 22px; margin: 0 0 18px; }
+        label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+        input { width: 100%; box-sizing: border-box; padding: 11px 12px; border: 1px solid #c8ced8; border-radius: 6px; font-size: 15px; }
+        button { margin-top: 16px; width: 100%; padding: 11px 14px; border: 0; border-radius: 6px; background: #2454d6; color: #fff; font-size: 15px; font-weight: 700; cursor: pointer; }
+        .error { color: #b42318; margin-top: 12px; min-height: 20px; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>FRP QuickStart 管理面板</h1>
+        <form id="loginForm">
+            <label for="secret">API 密钥</label>
+            <input id="secret" name="secret" type="password" autocomplete="current-password" required autofocus>
+            <button type="submit">进入</button>
+            <div class="error" id="error"></div>
+        </form>
+    </main>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const secret = document.getElementById('secret').value.trim();
+            const error = document.getElementById('error');
+            error.textContent = '';
+            try {
+                const res = await fetch('/api/stats', { headers: { 'X-Api-Secret': secret } });
+                if (!res.ok) {
+                    error.textContent = '密钥无效';
+                    return;
+                }
+                localStorage.setItem('frpquick_api_secret', secret);
+                location.href = '/admin?secret=' + encodeURIComponent(secret);
+            } catch (err) {
+                error.textContent = '无法连接管理 API';
+            }
+        });
+    </script>
+</body>
+</html>
+""";
+    var bytes = Encoding.UTF8.GetBytes(html);
+    var headers = $"HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\n\r\n";
+    await responseStream.WriteAsync(Encoding.UTF8.GetBytes(headers));
     await responseStream.WriteAsync(bytes);
     await responseStream.FlushAsync();
 }
@@ -1239,10 +1633,26 @@ static string GetAdminPageHtml()
     </div>
 
     <script>
+        const urlSecret = new URLSearchParams(window.location.search).get('secret');
+        if (urlSecret) {
+            localStorage.setItem('frpquick_api_secret', urlSecret);
+            history.replaceState(null, '', '/admin');
+        }
+
+        function authHeaders() {
+            const secret = localStorage.getItem('frpquick_api_secret') || '';
+            return { 'X-Api-Secret': secret };
+        }
+
         async function loadData() {
             try {
                 // 加载统计数据
-                const statsRes = await fetch('/api/stats');
+                const statsRes = await fetch('/api/stats', { headers: authHeaders() });
+                if (statsRes.status === 401) {
+                    localStorage.removeItem('frpquick_api_secret');
+                    location.href = '/admin';
+                    return;
+                }
                 const stats = await statsRes.json();
 
                 document.getElementById('totalTunnels').textContent = stats.TotalTunnels;
@@ -1250,7 +1660,12 @@ static string GetAdminPageHtml()
                 document.getElementById('occupiedPorts').textContent = stats.OccupiedPorts.length;
 
                 // 加载隧道列表
-                const tunnelsRes = await fetch('/api/tunnels/list');
+                const tunnelsRes = await fetch('/api/tunnels/list', { headers: authHeaders() });
+                if (tunnelsRes.status === 401) {
+                    localStorage.removeItem('frpquick_api_secret');
+                    location.href = '/admin';
+                    return;
+                }
                 const tunnelsData = await tunnelsRes.json();
 
                 const container = document.getElementById('tunnelsTable');
@@ -1328,4 +1743,176 @@ static string GetAdminPageHtml()
 """;
 }
 
-internal sealed record SimpleHttpRequest(string Method, string Path, byte[] Body);
+internal sealed record AcmeCertificatePaths(string FullChainPath, string KeyPath);
+
+internal sealed class TlsCertificateProvider
+{
+    private readonly object _lock = new();
+    private readonly string? _fullChainPath;
+    private readonly string? _keyPath;
+    private X509Certificate2 _certificate;
+    private SslStreamCertificateContext _certificateContext;
+    private DateTime _fullChainLastWriteUtc;
+    private DateTime _keyLastWriteUtc;
+
+    private TlsCertificateProvider(
+        X509Certificate2 certificate,
+        SslStreamCertificateContext certificateContext,
+        string? fullChainPath,
+        string? keyPath)
+    {
+        _certificate = certificate;
+        _certificateContext = certificateContext;
+        _fullChainPath = fullChainPath;
+        _keyPath = keyPath;
+        RefreshWriteTimes();
+    }
+
+    public static TlsCertificateProvider FromCertificate(X509Certificate2 certificate)
+    {
+        return new TlsCertificateProvider(
+            certificate,
+            SslStreamCertificateContext.Create(certificate, additionalCertificates: null),
+            fullChainPath: null,
+            keyPath: null);
+    }
+
+    public static TlsCertificateProvider FromPemFiles(string fullChainPath, string keyPath)
+    {
+        var (certificate, context) = LoadPemContext(fullChainPath, keyPath);
+        return new TlsCertificateProvider(certificate, context, fullChainPath, keyPath);
+    }
+
+    public X509Certificate2 CurrentCertificate
+    {
+        get
+        {
+            lock (_lock)
+            {
+                ReloadIfChanged();
+                return _certificate;
+            }
+        }
+    }
+
+    public string Fingerprint
+    {
+        get
+        {
+            lock (_lock)
+            {
+                ReloadIfChanged();
+                return _certificate.GetCertHashString(HashAlgorithmName.SHA256);
+            }
+        }
+    }
+
+    public SslServerAuthenticationOptions CreateAuthenticationOptions()
+    {
+        lock (_lock)
+        {
+            ReloadIfChanged();
+            return new SslServerAuthenticationOptions
+            {
+                ServerCertificateContext = _certificateContext,
+                ClientCertificateRequired = false,
+                EnabledSslProtocols = SslProtocols.Tls13 | SslProtocols.Tls12,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+            };
+        }
+    }
+
+    private void ReloadIfChanged()
+    {
+        if (_fullChainPath is null || _keyPath is null)
+        {
+            return;
+        }
+
+        var fullChainLastWriteUtc = File.GetLastWriteTimeUtc(_fullChainPath);
+        var keyLastWriteUtc = File.GetLastWriteTimeUtc(_keyPath);
+        if (fullChainLastWriteUtc == _fullChainLastWriteUtc && keyLastWriteUtc == _keyLastWriteUtc)
+        {
+            return;
+        }
+
+        var (certificate, context) = LoadPemContext(_fullChainPath, _keyPath);
+        _certificate = certificate;
+        _certificateContext = context;
+        _fullChainLastWriteUtc = fullChainLastWriteUtc;
+        _keyLastWriteUtc = keyLastWriteUtc;
+        Console.WriteLine($"TLS: 检测到证书文件更新，已重新加载 {_fullChainPath}");
+    }
+
+    private void RefreshWriteTimes()
+    {
+        if (_fullChainPath is not null)
+        {
+            _fullChainLastWriteUtc = File.GetLastWriteTimeUtc(_fullChainPath);
+        }
+
+        if (_keyPath is not null)
+        {
+            _keyLastWriteUtc = File.GetLastWriteTimeUtc(_keyPath);
+        }
+    }
+
+    private static (X509Certificate2 Certificate, SslStreamCertificateContext Context) LoadPemContext(string fullChainPath, string keyPath)
+    {
+        var certificate = X509Certificate2.CreateFromPemFile(fullChainPath, keyPath);
+        var publicCertificates = LoadCertificatesFromPem(fullChainPath);
+        var intermediates = new X509Certificate2Collection();
+        for (var i = 1; i < publicCertificates.Count; i++)
+        {
+            intermediates.Add(publicCertificates[i]);
+        }
+
+        return (certificate, SslStreamCertificateContext.Create(certificate, intermediates));
+    }
+
+    private static X509Certificate2Collection LoadCertificatesFromPem(string path)
+    {
+        var text = File.ReadAllText(path, Encoding.ASCII);
+        var certificates = new X509Certificate2Collection();
+        const string beginMarker = "-----BEGIN CERTIFICATE-----";
+        const string endMarker = "-----END CERTIFICATE-----";
+
+        var searchIndex = 0;
+        while (true)
+        {
+            var begin = text.IndexOf(beginMarker, searchIndex, StringComparison.Ordinal);
+            if (begin < 0)
+            {
+                break;
+            }
+
+            begin += beginMarker.Length;
+            var end = text.IndexOf(endMarker, begin, StringComparison.Ordinal);
+            if (end < 0)
+            {
+                throw new InvalidOperationException($"证书 PEM 格式无效: {path}");
+            }
+
+            var base64 = text[begin..end]
+                .Replace("\r", "", StringComparison.Ordinal)
+                .Replace("\n", "", StringComparison.Ordinal)
+                .Trim();
+            certificates.Add(X509CertificateLoader.LoadCertificate(Convert.FromBase64String(base64)));
+            searchIndex = end + endMarker.Length;
+        }
+
+        if (certificates.Count == 0)
+        {
+            throw new InvalidOperationException($"证书 PEM 中没有 CERTIFICATE 块: {path}");
+        }
+
+        return certificates;
+    }
+}
+
+internal sealed record SimpleHttpRequest(
+    string Method,
+    string Path,
+    string QueryString,
+    IReadOnlyDictionary<string, string> Headers,
+    byte[] Body);

@@ -104,21 +104,10 @@ try
     }
     catch (HttpRequestException ex) when (tlsMode != "none")
     {
-        Console.Error.WriteLine($"[警告] 无法通过 HTTPS 访问服务器健康检查: {ex.Message}");
+        Console.Error.WriteLine($"[安全错误] 无法通过 HTTPS 访问服务器健康检查: {ex.Message}");
         Console.Error.WriteLine("可能原因: 服务器未启用 TLS，或证书不受信任。");
-        Console.Write("是否尝试使用 HTTP 明文连接? (yes/no): ");
-        var answer = Console.ReadLine()?.Trim().ToLowerInvariant();
-        if (answer is "yes" or "y")
-        {
-            tlsMode = "none";
-            controlUrl = BuildControlUrl(serverHost, controlPort, "none");
-            health = await healthHttp.GetFromJsonAsync(controlUrl.Replace("/api/tunnels", "").TrimEnd('/') + "/health", FrpQuickJsonContext.Default.HealthResponse);
-        }
-        else
-        {
-            Console.Error.WriteLine("用户取消连接。");
-            return;
-        }
+        Console.Error.WriteLine("为避免 TLS 降级攻击，客户端不会自动切换到 HTTP。请修复 TLS 配置后重试。");
+        return;
     }
 
     if (health is not null)
@@ -156,8 +145,15 @@ try
 }
 catch (Exception ex)
 {
+    if (tlsMode != "none")
+    {
+        Console.Error.WriteLine($"[安全错误] 无法验证服务器 TLS 配置: {ex.Message}");
+        Console.Error.WriteLine("连接已拒绝。");
+        return;
+    }
+
     Console.WriteLine($"[警告] 无法验证服务器 TLS 配置: {ex.Message}");
-    Console.WriteLine("将继续尝试连接，但请确保网络安全。");
+    Console.WriteLine("当前使用 HTTP 明文模式，将继续尝试连接。");
 }
 
 var clientName = Environment.MachineName;
