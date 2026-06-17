@@ -661,16 +661,18 @@ static bool FixedTimeEquals(string left, string right)
 
 static void AppendTunnelRecord(string runtimeDir, TunnelRequest request, string proxyName)
 {
-    var record = JsonSerializer.Serialize(new
+    // ROB-9 FIX: 使用命名类型代替匿名类型以支持 trimming
+    var record = new TunnelRecord
     {
         Time = DateTimeOffset.UtcNow,
-        request.Protocol,
-        request.RemotePort,
-        request.LocalIp,
-        request.LocalPort,
-        request.ClientName,
+        Protocol = request.Protocol,
+        RemotePort = request.RemotePort,
+        LocalIp = request.LocalIp,
+        LocalPort = request.LocalPort,
+        ClientName = request.ClientName,
         ProxyName = proxyName
-    });
+    };
+    var json = JsonSerializer.Serialize(record, FrpQuickJsonContext.Default.TunnelRecord);
 
     var recordPath = Path.Combine(runtimeDir, "tunnels.jsonl");
 
@@ -690,7 +692,7 @@ static void AppendTunnelRecord(string runtimeDir, TunnelRequest request, string 
         // 轮转失败不阻塞记录写入
     }
 
-    File.AppendAllText(recordPath, record + Environment.NewLine, Encoding.UTF8);
+    File.AppendAllText(recordPath, json + Environment.NewLine, Encoding.UTF8);
 }
 
 static async Task WriteErrorAsync(Stream stream, HttpStatusCode statusCode, string message)

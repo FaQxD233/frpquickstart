@@ -55,7 +55,62 @@ var controlUrl = BuildControlUrl(serverHost, controlPort, tlsMode);
 Console.WriteLine("正在验证服务器 TLS 配置...");
 try
 {
-    using var healthHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+    // 为 /health 查询创建支持自签证书的 HttpClient
+    HttpMessageHandler healthHandler;
+    if (tlsMode == "self-signed" && tlsFingerprint is not null)
+    {
+        var expectedFingerprint = tlsFingerprint.ToUpperInvariant().Replace(":", "").Replace(" ", "");
+        healthHandler = new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = (_, cert, _, sslPolicyErrors) =>
+            {
+                Console.WriteLine($"[调试] 证书验证回调 - SSL错误: {sslPolicyErrors}");
+                if (cert is null)
+                {
+                    Console.WriteLine("[调试] 证书为空");
+                    return false;
+                }
+                Console.WriteLine($"[调试] 证书主题: {cert.Subject}");
+                Console.WriteLine($"[调试] 有效期: {cert.NotBefore:u} - {cert.NotAfter:u}");
+
+                // 自签名证书允许主机名不匹配和证书链不受信任
+                var allowedErrors = SslPolicyErrors.RemoteCertificateNameMismatch | SslPolicyErrors.RemoteCertificateChainErrors;
+                if ((sslPolicyErrors & ~allowedErrors) != SslPolicyErrors.None)
+                {
+                    Console.WriteLine($"[调试] 不允许的SSL错误: {sslPolicyErrors & ~allowedErrors}");
+                    return false;
+                }
+
+                var now = DateTimeOffset.UtcNow;
+                if (cert.NotBefore > now || cert.NotAfter < now)
+                {
+                    Console.WriteLine($"[调试] 证书已过期或尚未生效");
+                    return false;
+                }
+
+                try
+                {
+                    var actualFingerprint = cert.GetCertHashString(HashAlgorithmName.SHA256).ToUpperInvariant();
+                    Console.WriteLine($"[调试] 实际指纹: {actualFingerprint}");
+                    Console.WriteLine($"[调试] 期望指纹: {expectedFingerprint}");
+                    var match = string.Equals(actualFingerprint, expectedFingerprint, StringComparison.OrdinalIgnoreCase);
+                    Console.WriteLine($"[调试] 指纹匹配: {match}");
+                    return match;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[调试] 指纹计算失败: {ex.Message}");
+                    return false;
+                }
+            }
+        };
+    }
+    else
+    {
+        healthHandler = new HttpClientHandler();
+    }
+
+    using var healthHttp = new HttpClient(healthHandler) { Timeout = TimeSpan.FromSeconds(5) };
     var healthUrl = controlUrl.Replace("/api/tunnels", "").TrimEnd('/') + "/health";
     HealthResponse? health = null;
 
@@ -146,8 +201,8 @@ try
                 if (cert is null) return false;
 
                 // SEC-1 FIX: 检查证书有效性，即使指纹匹配也要拒绝过期/吊销证书
-                // 自签名证书允许 RemoteCertificateNameMismatch (主机名不匹配)
-                var allowedErrors = SslPolicyErrors.RemoteCertificateNameMismatch;
+                // 自签名证书允许 RemoteCertificateNameMismatch (主机名不匹配) 和 RemoteCertificateChainErrors (链不受信任)
+                var allowedErrors = SslPolicyErrors.RemoteCertificateNameMismatch | SslPolicyErrors.RemoteCertificateChainErrors;
                 if ((sslPolicyErrors & ~allowedErrors) != SslPolicyErrors.None)
                 {
                     Console.Error.WriteLine($"[TLS 验证失败] 证书存在安全问题: {sslPolicyErrors}");

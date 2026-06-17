@@ -43,7 +43,19 @@ public sealed class HealthResponse
     public string TlsFingerprint { get; set; } = "";
 }
 
+public sealed class TunnelRecord
+{
+    public DateTimeOffset Time { get; set; }
+    public string Protocol { get; set; } = "";
+    public int RemotePort { get; set; }
+    public string LocalIp { get; set; } = "";
+    public int LocalPort { get; set; }
+    public string ClientName { get; set; } = "";
+    public string ProxyName { get; set; } = "";
+}
+
 [JsonSerializable(typeof(TunnelRequest))]
 [JsonSerializable(typeof(TunnelResponse))]
 [JsonSerializable(typeof(HealthResponse))]
+[JsonSerializable(typeof(TunnelRecord))]
 public partial class FrpQuickJsonContext : JsonSerializerContext;
