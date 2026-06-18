@@ -3,3 +3,12 @@ obj/
 artifacts/
 runtime/
 server-config.json
+release/*-linux-x64/
+release/*-win-x64/
+release/*.tar.gz
+release/*.zip
+release/*.sha256
+release/checksums.sha256
+release/install-*.sh
+!release/*.ps1
+!release/publish-linux-on-ubuntu.sh

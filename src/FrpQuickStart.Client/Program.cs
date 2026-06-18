@@ -18,8 +18,8 @@ Console.OutputEncoding = Encoding.UTF8;
 // 设置窗口标题
 Console.Title = "FRP QuickStart Client";
 
-Console.WriteLine("FRP QuickStart Windows Client");
-Console.WriteLine("请按提示填写 Ubuntu 服务器和本地服务信息。");
+Console.WriteLine("FRP QuickStart Client");
+Console.WriteLine("请按提示填写服务端和本地服务信息。");
 Console.WriteLine();
 
 var shareLink = GetOption(args, "--share");
@@ -37,7 +37,7 @@ if (!string.IsNullOrWhiteSpace(shareLink))
 }
 else
 {
-    var serverInput = GetOption(args, "--server") ?? PromptRequired("Ubuntu 控制服务 IP/域名或分享链接");
+    var serverInput = GetOption(args, "--server") ?? PromptRequired("服务端控制地址或分享链接");
     if (TryParseShareLink(serverInput, out shareConfig, out _))
     {
         Console.WriteLine($"已导入分享链接配置: {shareConfig!.Server}:{shareConfig.ControlPort} ({shareConfig.TlsMode})");
@@ -51,17 +51,19 @@ else
 var serverHost = shareConfig?.Server ?? serverHostFromInput ?? GetOption(args, "--server");
 if (string.IsNullOrWhiteSpace(serverHost))
 {
-    Console.Error.WriteLine("缺少 Ubuntu 控制服务 IP/域名。");
+    Console.Error.WriteLine("缺少服务端控制地址。");
     return;
 }
 
-var controlPort = GetIntOption(args, "--control-port") ?? shareConfig?.ControlPort ?? PromptPort("Ubuntu 控制服务端口", 9080);
+var controlPort = GetIntOption(args, "--control-port") ?? shareConfig?.ControlPort ?? PromptPort("服务端控制端口", 9080);
 var remotePort = GetIntOptionRequired(args, "--remote-port") ?? PromptPort("要开放在服务器上的公网端口", null);
 var localIp = GetOption(args, "--local-ip") ?? PromptWithDefault("本地监听 IP", "127.0.0.1");
 var localPort = GetIntOptionRequired(args, "--local-port") ?? PromptPort("本地监听端口", null);
 var secret = GetOption(args, "--secret") ?? shareConfig?.Secret ?? PromptSecret("连接密钥");
 var protocol = (GetOption(args, "--protocol") ?? "tcp").Trim().ToLowerInvariant();
-var bundledFrpcResource = OperatingSystem.IsWindows() ? "FrpQuickStart.Bundled.frpc.exe" : null;
+var bundledFrpcResource = OperatingSystem.IsWindows()
+    ? "FrpQuickStart.Bundled.frpc.exe"
+    : "FrpQuickStart.Bundled.frpc";
 var frpcPath = ProcessHelpers.ResolveExecutable(GetOption(args, "--frpc"), "frpc", bundledFrpcResource);
 
 if (protocol is not "tcp" and not "udp")
@@ -269,7 +271,7 @@ try
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"无法连接 Ubuntu 控制服务 {controlUrl}: {ex.Message}");
+    Console.Error.WriteLine($"无法连接服务端控制接口 {controlUrl}: {ex.Message}");
     return;
 }
 
@@ -568,21 +570,21 @@ static void PrintHelp()
       frpquick-client [选项]
 
     常用选项:
-      --server <ip或域名>          Ubuntu 控制服务 IP/域名
+      --server <ip或域名>          服务端控制地址
       --share <frpquick链接>       服务端打印的分享链接，可自动导入服务器/TLS/密钥配置
-      --control-port <端口>       Ubuntu 控制服务端口，默认 9080
+      --control-port <端口>       服务端控制端口，默认 9080
       --remote-port <端口>        要开放在服务器上的公网端口
       --local-ip <ip>             本地监听 IP，默认 127.0.0.1
       --local-port <端口>         本地监听端口
-      --secret <密钥>             Ubuntu 端打印的 API 密钥
+      --secret <密钥>             服务端 API 密钥
       --protocol <tcp|udp>        默认 tcp
-      --frpc <路径>               自定义 frpc.exe 路径，默认使用内置 frpc
+      --frpc <路径>               自定义 frpc 路径，默认使用内置 frpc
 
     TLS 选项:
       --tls <mode>                TLS 模式: none (默认) / self-signed / acme
       --tls-fingerprint <SHA256>  自签证书指纹 (self-signed 模式)
 
-    不传选项时会逐项询问。也可以在“Ubuntu 控制服务 IP/域名或分享链接”提示处直接粘贴 frpquick:// 分享链接。
+    不传选项时会逐项询问。也可以在“服务端控制地址或分享链接”提示处直接粘贴 frpquick:// 分享链接。
 
     TLS 模式说明:
       none        - 明文 HTTP，仅限受信网络/内网使用

@@ -3,21 +3,28 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $outRoot = Join-Path $root "artifacts\linux-x64-self-contained"
 
-dotnet publish (Join-Path $root "src\FrpQuickStart.Server\FrpQuickStart.Server.csproj") `
-  -c Release `
-  -r linux-x64 `
-  --self-contained true `
-  -p:PublishSingleFile=true `
-  -p:EnableCompressionInSingleFile=true `
-  -p:DebugType=None `
-  -p:DebugSymbols=false `
-  -o (Join-Path $outRoot "server")
-if ($LASTEXITCODE -ne 0) {
-  exit $LASTEXITCODE
+$projects = @(
+  @{ Name = "Server"; Output = "server" },
+  @{ Name = "Client"; Output = "client" }
+)
+
+foreach ($project in $projects) {
+  dotnet publish (Join-Path $root "src\FrpQuickStart.$($project.Name)\FrpQuickStart.$($project.Name).csproj") `
+    -c Release `
+    -r linux-x64 `
+    --self-contained true `
+    -p:PublishSingleFile=true `
+    -p:EnableCompressionInSingleFile=true `
+    -p:DebugType=None `
+    -p:DebugSymbols=false `
+    -o (Join-Path $outRoot $project.Output)
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
+
+  Get-ChildItem -Path (Join-Path $outRoot $project.Output) -Filter *.pdb -ErrorAction SilentlyContinue | Remove-Item -Force
 }
 
-Get-ChildItem -Path (Join-Path $outRoot "server") -Filter *.pdb -ErrorAction SilentlyContinue | Remove-Item -Force
-
 Write-Host "Linux server published to $outRoot\server"
-Write-Host "frps is embedded in frpquick-server and will be extracted automatically on first run."
-Write-Host "The server binary is self-contained; .NET Runtime is not required on the target Ubuntu machine."
+Write-Host "Linux client published to $outRoot\client"
+Write-Host "Both binaries are self-contained and embed the required frp component."

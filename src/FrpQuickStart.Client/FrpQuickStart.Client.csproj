@@ -11,4 +11,8 @@
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' Or ('$(RuntimeIdentifier)' == '' And '$(OS)' == 'Windows_NT')">
     <EmbeddedResource Include="..\..\third_party\frp\v0.69.1\win-x64\frpc.exe" LogicalName="FrpQuickStart.Bundled.frpc.exe" />
   </ItemGroup>
+
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' Or ('$(RuntimeIdentifier)' == '' And '$(OS)' != 'Windows_NT')">
+    <EmbeddedResource Include="..\..\third_party\frp\v0.69.1\linux-x64\frpc" LogicalName="FrpQuickStart.Bundled.frpc" />
+  </ItemGroup>
 </Project>
