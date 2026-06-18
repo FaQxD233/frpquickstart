@@ -26,18 +26,37 @@
 
 ## 最短用法
 
-服务端：
+先在 Windows 本机生成发布包并上传服务端：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\release\publish-linux-x64.ps1
+Copy-Item -Force .\artifacts\linux-x64-self-contained\server\frpquick-server .\release\server-linux-x64\frpquick-server
+tar -czf .\release\frpquick-server-linux-x64.tar.gz -C .\release\server-linux-x64 frpquick-server
+scp -i "C:\path\to\key.pem" .\release\frpquick-server-linux-x64.tar.gz ubuntu@<服务器IP>:/home/ubuntu/
+```
+
+VPS 上解压并启动服务端：
 
 ```bash
+mkdir -p ~/frpquickstart
+tar -xzf ~/frpquick-server-linux-x64.tar.gz -C ~/frpquickstart
+cd ~/frpquickstart
+chmod +x frpquick-server
 curl https://get.acme.sh | sh -s email=admin@example.com
 ./frpquick-server --tls acme --acme-id <你的公网IP> --acme-email admin@example.com
 ```
 
 记录服务端打印的 `frpquick://...` 分享链接。
 
-客户端：
+Windows 客户端：
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\release\publish-win-x64.ps1
+Copy-Item -Force .\artifacts\win-x64-self-contained\client\frpquick-client.exe .\release\client-win-x64\frpquick-client.exe
+tar -czf .\release\frpquick-client-win-x64.tar.gz -C .\release\client-win-x64 frpquick-client.exe
+mkdir C:\frpquickstart
+tar -xzf .\release\frpquick-client-win-x64.tar.gz -C C:\frpquickstart
+cd C:\frpquickstart
 .\frpquick-client.exe --share "frpquick://<服务器IP>:9080/?tls=acme&secret=<API密钥>" --remote-port 25565 --local-port 25565
 ```
 
@@ -204,6 +223,8 @@ Linux x64：
 - Ubuntu Linux: `artifacts/linux-x64-self-contained/server/frpquick-server`
 
 这两个可执行文件都已经包含对应 frp 组件，分发时不需要额外附带 `frpc.exe` 或 `frps`。
+
+如果要使用 GitHub Releases 下载链接，需要先把这两个压缩包上传到 GitHub Release。当前仓库不包含一键安装脚本；没有上传 Release 资产时，请使用上面的 `scp` 上传方式。
 
 ## 注意
 
