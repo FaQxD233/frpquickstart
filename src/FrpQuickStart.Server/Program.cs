@@ -25,6 +25,7 @@ Directory.CreateDirectory(runtimeDir);
 Console.WriteLine("FRP QuickStart Ubuntu Server");
 Console.WriteLine($"配置文件: {Path.GetFullPath(configPath)}");
 Console.WriteLine($"frps 端口: {settings.FrpsBindPort}");
+Console.WriteLine($"frp 传输协议: {settings.FrpTransportProtocol}");
 
 // ROB-6: 仅在首次生成密钥时明文显示，后续启动提示从配置文件查看
 if (settings.IsNewlyCreated)
@@ -77,6 +78,8 @@ if (tlsMode is not "none" and not "self-signed" and not "acme")
 
 TlsCertificateProvider? tlsCertificateProvider = null;
 string? tlsFingerprint = null;
+string? frpTransportTlsCertPath = null;
+string? frpTransportTlsKeyPath = null;
 
 if (tlsMode == "self-signed")
 {
@@ -93,14 +96,16 @@ if (tlsMode == "self-signed")
         }
 
         var password = File.ReadAllText(passwordPath, Encoding.UTF8).Trim();
-        var serverCert = X509CertificateLoader.LoadPkcs12FromFile(certPath, password);
+        var serverCert = X509CertificateLoader.LoadPkcs12FromFile(certPath, password, X509KeyStorageFlags.Exportable);
         tlsCertificateProvider = TlsCertificateProvider.FromCertificate(serverCert);
+        (frpTransportTlsCertPath, frpTransportTlsKeyPath) = EnsureSelfSignedPemFiles(serverCert, certPath);
         Console.WriteLine($"TLS: 加载已有自签证书 {certPath}");
     }
     else
     {
         var serverCert = GenerateSelfSignedCert(settings, certPath);
         tlsCertificateProvider = TlsCertificateProvider.FromCertificate(serverCert);
+        (frpTransportTlsCertPath, frpTransportTlsKeyPath) = EnsureSelfSignedPemFiles(serverCert, certPath);
         Console.WriteLine($"TLS: 已生成自签证书并保存到 {certPath}");
     }
     tlsFingerprint = tlsCertificateProvider.Fingerprint;
@@ -121,6 +126,8 @@ else if (tlsMode == "acme")
     }
 
     tlsCertificateProvider = TlsCertificateProvider.FromPemFiles(acmePaths.FullChainPath, acmePaths.KeyPath);
+    frpTransportTlsCertPath = acmePaths.FullChainPath;
+    frpTransportTlsKeyPath = acmePaths.KeyPath;
     var serverCert = tlsCertificateProvider.CurrentCertificate;
     Console.WriteLine($"TLS: 加载 acme fullchain 证书 {acmePaths.FullChainPath}");
 
@@ -136,6 +143,74 @@ else if (tlsMode == "acme")
     }
     Console.WriteLine("acme 证书由公共 CA 签发，客户端无需额外配置即可信任。");
     Console.WriteLine("acme.sh 续期后会覆盖 runtime/acme 下的证书文件；服务端会在新连接握手前自动重新加载。");
+}
+
+var frpTransportProtocol = GetOption(args, "--frp-transport") ?? settings.FrpTransportProtocol;
+try
+{
+    frpTransportProtocol = FrpConfigWriter.NormalizeTransportProtocol(frpTransportProtocol);
+}
+catch (ArgumentException ex)
+{
+    Console.Error.WriteLine(ex.Message);
+    return;
+}
+
+if (GetOption(args, "--frp-transport") is null && settings.IsNewlyCreated)
+{
+    Console.WriteLine("请选择 frpc 连接 frps 的传输协议:");
+    Console.WriteLine("  tcp       - 默认 TCP，兼容性最好");
+    Console.WriteLine("  websocket - WebSocket 明文封装");
+    Console.WriteLine("  wss       - WebSocket over TLS，建议配合 --tls acme");
+    Console.WriteLine("  kcp       - UDP/KCP，需要放行同一个 frps 端口的 UDP");
+    Console.WriteLine("  quic      - UDP/QUIC，需要放行同一个 frps 端口的 UDP");
+    Console.Write($"请选择 [tcp/websocket/wss/kcp/quic] [{frpTransportProtocol}]: ");
+    var input = Console.ReadLine()?.Trim();
+    if (!string.IsNullOrWhiteSpace(input))
+    {
+        try
+        {
+            frpTransportProtocol = FrpConfigWriter.NormalizeTransportProtocol(input);
+        }
+        catch (ArgumentException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return;
+        }
+    }
+}
+
+if (frpTransportProtocol == "wss" && tlsCertificateProvider is null)
+{
+    Console.Error.WriteLine("wss 传输需要服务端 TLS 证书。请使用 --tls acme 或 --tls self-signed。");
+    return;
+}
+
+var settingsChanged = false;
+if (frpTransportProtocol == "wss")
+{
+    settingsChanged =
+        !string.Equals(settings.TlsCertPath, frpTransportTlsCertPath, StringComparison.OrdinalIgnoreCase) ||
+        !string.Equals(settings.TlsKeyPath, frpTransportTlsKeyPath, StringComparison.OrdinalIgnoreCase);
+    settings.TlsCertPath = frpTransportTlsCertPath ?? "";
+    settings.TlsKeyPath = frpTransportTlsKeyPath ?? "";
+}
+
+if (!string.Equals(settings.FrpTransportProtocol, frpTransportProtocol, StringComparison.OrdinalIgnoreCase))
+{
+    settings.FrpTransportProtocol = frpTransportProtocol;
+    settingsChanged = true;
+}
+
+if (settingsChanged)
+{
+    settings.SaveTo(configPath);
+}
+
+Console.WriteLine($"frp 传输协议: {frpTransportProtocol}");
+if (frpTransportProtocol is "kcp" or "quic")
+{
+    Console.WriteLine($"提示: {frpTransportProtocol} 需要放行 UDP/{settings.FrpsBindPort}。");
 }
 
 var protocolPrefix = tlsMode == "none" ? "http" : "https";
@@ -157,7 +232,7 @@ if (string.IsNullOrWhiteSpace(shareAddress))
 }
 else
 {
-    var shareLink = BuildShareLink(shareAddress, settings.ControlPort, tlsMode, settings.ApiSecret, tlsFingerprint);
+    var shareLink = BuildShareLink(shareAddress, settings.ControlPort, tlsMode, settings.ApiSecret, tlsFingerprint, settings.FrpTransportProtocol);
     Console.WriteLine("客户端分享链接（包含 API 密钥，请只发给可信用户）:");
     Console.WriteLine(shareLink);
 }
@@ -281,7 +356,14 @@ static Process? EnsureFrps(ServerSettings settings, string runtimeDir)
 
     var frpsConfigPath = Path.Combine(runtimeDir, "frps.toml");
     var frpsLogPath = Path.Combine(runtimeDir, "frps.log");
-    FrpConfigWriter.WriteFrpsToml(frpsConfigPath, settings.FrpsBindPort, settings.FrpAuthToken, frpsLogPath);
+    FrpConfigWriter.WriteFrpsToml(
+        frpsConfigPath,
+        settings.FrpsBindPort,
+        settings.FrpAuthToken,
+        frpsLogPath,
+        settings.FrpTransportProtocol,
+        settings.TlsCertPath,
+        settings.TlsKeyPath);
 
     var bundledFrpsResource = OperatingSystem.IsWindows()
         ? "FrpQuickStart.Bundled.frps.exe"
@@ -388,13 +470,39 @@ static X509Certificate2 GenerateSelfSignedCert(ServerSettings settings, string s
 
     // Also save PEM for inspection
     var pemPath = Path.ChangeExtension(savePath, ".pem");
-    File.WriteAllText(pemPath, cert.ExportCertificatePem());
+    File.WriteAllText(pemPath, cert.ExportCertificatePem(), new UTF8Encoding(false));
 
     Console.WriteLine($"[安全提示] 证书密码已保存到: {passwordPath}");
     Console.WriteLine("请妥善保管该密码文件，删除后证书将无法加载。");
 
     // Return a new instance with the private key available
-    return X509CertificateLoader.LoadPkcs12(pfxBytes, password);
+    return X509CertificateLoader.LoadPkcs12(pfxBytes, password, X509KeyStorageFlags.Exportable);
+}
+
+static (string CertPath, string KeyPath) EnsureSelfSignedPemFiles(X509Certificate2 certificate, string pfxPath)
+{
+    var certPath = Path.ChangeExtension(pfxPath, ".pem");
+    var keyPath = Path.Combine(
+        Path.GetDirectoryName(Path.GetFullPath(pfxPath))!,
+        Path.GetFileNameWithoutExtension(pfxPath) + "-key.pem");
+
+    var utf8NoBom = new UTF8Encoding(false);
+    File.WriteAllText(certPath, certificate.ExportCertificatePem(), utf8NoBom);
+
+    using var rsa = certificate.GetRSAPrivateKey();
+    if (rsa is null)
+    {
+        throw new InvalidOperationException("自签证书不包含可导出的 RSA 私钥，无法用于 frps wss 传输。");
+    }
+
+    File.WriteAllText(keyPath, rsa.ExportPkcs8PrivateKeyPem(), utf8NoBom);
+    if (!OperatingSystem.IsWindows())
+    {
+        File.SetUnixFileMode(certPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        File.SetUnixFileMode(keyPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+    }
+
+    return (certPath, keyPath);
 }
 
 static async Task<AcmeCertificatePaths> EnsureAcmeCertificateAsync(ServerSettings settings, string runtimeDir, string[] args)
@@ -764,6 +872,7 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
                 Message = "ok",
                 PublicAddress = settings.PublicAddress,
                 FrpsBindPort = settings.FrpsBindPort,
+                FrpTransportProtocol = settings.FrpTransportProtocol,
                 ControlPort = settings.ControlPort,
                 FrpsStartedByServer = isFrpsManagedByServer(),
                 TlsMode = tlsMode,
@@ -917,6 +1026,7 @@ static async Task HandleRequestAsync(Stream responseStream, SimpleHttpRequest ht
             Message = "accepted",
             FrpServerAddress = settings.PublicAddress,
             FrpServerPort = settings.FrpsBindPort,
+            FrpTransportProtocol = settings.FrpTransportProtocol,
             Token = settings.FrpAuthToken,
             RemotePort = request.RemotePort,
             Protocol = request.Protocol,
@@ -1487,12 +1597,13 @@ static async Task<string?> TryDiscoverPublicIpv4Async()
     return null;
 }
 
-static string BuildShareLink(string serverAddress, int controlPort, string tlsMode, string apiSecret, string? tlsFingerprint)
+static string BuildShareLink(string serverAddress, int controlPort, string tlsMode, string apiSecret, string? tlsFingerprint, string frpTransportProtocol)
 {
     var builder = new UriBuilder("frpquick", serverAddress, controlPort);
     var query = new List<string>
     {
         "tls=" + Uri.EscapeDataString(tlsMode),
+        "transport=" + Uri.EscapeDataString(frpTransportProtocol),
         "secret=" + Uri.EscapeDataString(apiSecret)
     };
 
@@ -1592,6 +1703,7 @@ static void PrintHelp()
     选项:
       --config <path>           配置文件路径，默认 server-config.json
       --tls <mode>              TLS 模式: none (默认) / self-signed / acme
+      --frp-transport <protocol> frpc 连接 frps 的传输协议: tcp/websocket/wss/kcp/quic，默认 tcp
       --tls-cert <path>         ACME fullchain 输出路径，默认 runtime/acme/fullchain.pem
       --tls-key <path>          ACME 私钥输出路径，默认 runtime/acme/key.pem
       --acme-id <ip-or-host>    ACME 标识符，IP 证书填写公网 IP；默认使用 PublicAddress
@@ -1604,6 +1716,7 @@ static void PrintHelp()
 
     首次启动会生成 server-config.json，并打印 API 密钥。
     默认使用内置 frps；如需覆盖，请修改 server-config.json 的 FrpsPath。
+    frp 传输协议也可在 server-config.json 的 FrpTransportProtocol 中修改。
 
     TLS 模式:
       none        - 明文 HTTP，仅限受信网络/内网使用

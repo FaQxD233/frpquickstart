@@ -35,6 +35,7 @@ PUBLIC_IP="$(curl -4fsSL https://ip.sb)"
 curl -fsSL https://github.com/FaQxD233/frpquickstart/releases/latest/download/install-server.sh \
   | sudo bash -s -- \
       --tls acme \
+      --frp-transport tcp \
       --acme-id "$PUBLIC_IP" \
       --acme-email admin@example.com
 ```
@@ -45,7 +46,7 @@ curl -fsSL https://github.com/FaQxD233/frpquickstart/releases/latest/download/in
 sudo journalctl -u frpquickstart -n 80 --no-pager
 ```
 
-日志中会打印 `frpquick://...` 分享链接。客户端可以直接粘贴这条链接导入服务端地址、TLS 模式和 API 密钥。
+日志中会打印 `frpquick://...` 分享链接。客户端可以直接粘贴这条链接导入服务端地址、TLS 模式、frp 传输协议和 API 密钥。
 
 ## Windows 客户端快速使用
 
@@ -53,7 +54,7 @@ sudo journalctl -u frpquickstart -n 80 --no-pager
 
 ```powershell
 .\frpquick-client.exe `
-  --share "frpquick://<服务器IP>:9080/?tls=acme&secret=<API密钥>" `
+  --share "frpquick://<服务器IP>:9080/?tls=acme&transport=tcp&secret=<API密钥>" `
   --remote-port 18080 `
   --local-port 8080
 ```
@@ -66,7 +67,7 @@ VPS 防火墙和云安全组至少需要放行：
 
 - `80/tcp`: ACME HTTP-01 校验，仅 `--tls acme` 需要
 - `9080/tcp`: 控制端口和 Web 管理界面
-- `7000/tcp`: frpc 连接 frps 的端口
+- `7000/tcp`: frpc 连接 frps 的默认端口。`tcp/websocket/wss` 放行 TCP，`kcp/quic` 放行 UDP
 - 业务端口，例如 `18080/tcp`、`25565/tcp`
 
 ## Web 管理界面
@@ -84,6 +85,16 @@ https://<服务器IP>:9080/admin
 ## TLS
 
 生产环境建议使用 `--tls acme`。该模式会调用 `acme.sh` 申请 Let's Encrypt short-lived IP 证书，默认 7 天有效期。`acme.sh` 续期后会覆盖 `runtime/acme/fullchain.pem` 和 `runtime/acme/key.pem`，服务端会在新连接握手前自动重新加载证书。
+
+这里的 TLS 默认保护控制接口和 Web 管理界面，也就是 API 密钥、frp token、隧道配置下发等控制面数据。frpc 到 frps 的传输协议由 `--frp-transport` 控制，支持 `tcp`、`websocket`、`wss`、`kcp`、`quic`。服务端会把该协议写入 `frpquick://` 分享链接的 `transport=` 参数，客户端导入后自动使用。
+
+如果需要更像普通 HTTPS/WebSocket 流量，可在服务端使用：
+
+```bash
+./frpquick-server --tls acme --frp-transport wss --acme-id "$PUBLIC_IP" --acme-email admin@example.com
+```
+
+`wss` 会复用 ACME 证书给 frps 使用，但不要求占用 443 端口；默认仍使用 `FrpsBindPort`，也就是 `7000`。如需换端口，修改 `server-config.json` 的 `FrpsBindPort` 后重启服务，并同步放行对应端口。
 
 可选 TLS 模式：
 

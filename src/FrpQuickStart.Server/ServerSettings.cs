@@ -10,6 +10,7 @@ public sealed class ServerSettings
     public int ControlPort { get; set; } = 9080;
     public string PublicAddress { get; set; } = "";
     public int FrpsBindPort { get; set; } = 7000;
+    public string FrpTransportProtocol { get; set; } = "tcp";
     public string ApiSecret { get; set; } = "";
     public string FrpAuthToken { get; set; } = "";
     public string FrpsPath { get; set; } = "frps";
@@ -128,6 +129,7 @@ public sealed class ServerSettings
         }
 
         PublicAddress = Environment.GetEnvironmentVariable("FRPQS_PUBLIC_ADDR") ?? PublicAddress;
+        FrpTransportProtocol = Environment.GetEnvironmentVariable("FRPQS_FRP_TRANSPORT") ?? FrpTransportProtocol;
 
         TlsMode = Environment.GetEnvironmentVariable("FRPQS_TLS_MODE") ?? TlsMode;
         TlsCertPath = Environment.GetEnvironmentVariable("FRPQS_TLS_CERT") ?? TlsCertPath;
@@ -160,6 +162,11 @@ public sealed class ServerSettings
         {
             FrpAuthToken = CreateSecret();
         }
+    }
+
+    public void SaveTo(string path)
+    {
+        Save(path, this);
     }
 
     private static string CreateSecret()

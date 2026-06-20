@@ -33,14 +33,14 @@ if (!string.IsNullOrWhiteSpace(shareLink))
         return;
     }
 
-    Console.WriteLine($"已导入分享链接配置: {shareConfig!.Server}:{shareConfig.ControlPort} ({shareConfig.TlsMode})");
+    Console.WriteLine($"已导入分享链接配置: {shareConfig!.Server}:{shareConfig.ControlPort} ({shareConfig.TlsMode}, transport={shareConfig.FrpTransportProtocol})");
 }
 else
 {
     var serverInput = GetOption(args, "--server") ?? PromptRequired("服务端控制地址或分享链接");
     if (TryParseShareLink(serverInput, out shareConfig, out _))
     {
-        Console.WriteLine($"已导入分享链接配置: {shareConfig!.Server}:{shareConfig.ControlPort} ({shareConfig.TlsMode})");
+        Console.WriteLine($"已导入分享链接配置: {shareConfig!.Server}:{shareConfig.ControlPort} ({shareConfig.TlsMode}, transport={shareConfig.FrpTransportProtocol})");
     }
     else
     {
@@ -61,6 +61,16 @@ var localIp = GetOption(args, "--local-ip") ?? PromptWithDefault("本地监听 I
 var localPort = GetIntOptionRequired(args, "--local-port") ?? PromptPort("本地监听端口", null);
 var secret = GetOption(args, "--secret") ?? shareConfig?.Secret ?? PromptSecret("连接密钥");
 var protocol = (GetOption(args, "--protocol") ?? "tcp").Trim().ToLowerInvariant();
+var requestedFrpTransportProtocol = GetOption(args, "--frp-transport") ?? shareConfig?.FrpTransportProtocol ?? "tcp";
+try
+{
+    requestedFrpTransportProtocol = FrpConfigWriter.NormalizeTransportProtocol(requestedFrpTransportProtocol);
+}
+catch (ArgumentException ex)
+{
+    Console.Error.WriteLine(ex.Message);
+    return;
+}
 var bundledFrpcResource = OperatingSystem.IsWindows()
     ? "FrpQuickStart.Bundled.frpc.exe"
     : "FrpQuickStart.Bundled.frpc";
@@ -149,6 +159,10 @@ try
     if (health is not null)
     {
         Console.WriteLine($"服务器 TLS 模式: {health.TlsMode}");
+        if (!string.IsNullOrWhiteSpace(health.FrpTransportProtocol))
+        {
+            Console.WriteLine($"服务器 frp 传输协议: {health.FrpTransportProtocol}");
+        }
 
         // 检查客户端与服务器 TLS 模式是否匹配
         if (!string.Equals(health.TlsMode, tlsMode, StringComparison.OrdinalIgnoreCase))
@@ -278,6 +292,18 @@ catch (Exception ex)
 var frpServerAddress = string.IsNullOrWhiteSpace(response.FrpServerAddress)
     ? serverHost
     : response.FrpServerAddress;
+var frpTransportProtocol = string.IsNullOrWhiteSpace(response.FrpTransportProtocol)
+    ? requestedFrpTransportProtocol
+    : response.FrpTransportProtocol;
+try
+{
+    frpTransportProtocol = FrpConfigWriter.NormalizeTransportProtocol(frpTransportProtocol);
+}
+catch (ArgumentException ex)
+{
+    Console.Error.WriteLine($"服务器返回了不支持的 frp 传输协议: {ex.Message}");
+    return;
+}
 var proxyName = string.IsNullOrWhiteSpace(response.ProxyName)
     ? FrpConfigWriter.SafeProxyName(clientName, remotePort, protocol)
     : response.ProxyName;
@@ -289,6 +315,7 @@ FrpConfigWriter.WriteFrpcToml(
     frpServerAddress,
     response.FrpServerPort,
     response.Token,
+    frpTransportProtocol,
     proxyName,
     response.Protocol,
     localIp,
@@ -299,6 +326,7 @@ Console.WriteLine();
 Console.WriteLine("隧道配置已生成:");
 Console.WriteLine($"  {frpcConfigPath}");
 Console.WriteLine($"公网访问地址: {frpServerAddress}:{response.RemotePort}");
+Console.WriteLine($"frp 传输协议: {frpTransportProtocol}");
 Console.WriteLine("正在启动 frpc，保持此窗口打开即可保持穿透在线。按 Ctrl+C 停止。");
 
 // 更新窗口标题显示端口信息
@@ -381,6 +409,19 @@ static bool TryParseShareLink(string value, out ShareLinkConfig? config, out str
         return false;
     }
 
+    var frpTransportProtocol = parameters.TryGetValue("transport", out var transportValue)
+        ? transportValue
+        : "tcp";
+    try
+    {
+        frpTransportProtocol = FrpConfigWriter.NormalizeTransportProtocol(frpTransportProtocol);
+    }
+    catch (ArgumentException)
+    {
+        error = $"frp 传输协议无效: {frpTransportProtocol}";
+        return false;
+    }
+
     if (!parameters.TryGetValue("secret", out var secret) || string.IsNullOrWhiteSpace(secret))
     {
         error = "缺少 API 密钥。";
@@ -393,7 +434,7 @@ static bool TryParseShareLink(string value, out ShareLinkConfig? config, out str
         parameters.TryGetValue("fingerprint", out fingerprint);
     }
 
-    config = new ShareLinkConfig(server, controlPort, tlsMode, secret, fingerprint ?? "");
+    config = new ShareLinkConfig(server, controlPort, tlsMode, frpTransportProtocol, secret, fingerprint ?? "");
     return true;
 }
 
@@ -578,6 +619,7 @@ static void PrintHelp()
       --local-port <端口>         本地监听端口
       --secret <密钥>             服务端 API 密钥
       --protocol <tcp|udp>        默认 tcp
+      --frp-transport <protocol>  frpc 连接 frps 的传输协议，默认由服务端下发；可用 tcp/kcp/quic/websocket/wss
       --frpc <路径>               自定义 frpc 路径，默认使用内置 frpc
 
     TLS 选项:
@@ -599,5 +641,6 @@ internal sealed record ShareLinkConfig(
     string Server,
     int ControlPort,
     string TlsMode,
+    string FrpTransportProtocol,
     string Secret,
     string TlsFingerprint);

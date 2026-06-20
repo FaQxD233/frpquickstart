@@ -12,6 +12,7 @@ CONTROL_PORT=""
 SECRET=""
 TLS_MODE=""
 TLS_FINGERPRINT=""
+FRP_TRANSPORT=""
 REMOTE_PORT=""
 LOCAL_IP="127.0.0.1"
 LOCAL_PORT=""
@@ -34,6 +35,7 @@ Options:
   --secret <secret>          API secret when not using --share
   --tls <mode>               acme, self-signed, or none
   --tls-fingerprint <fp>     Required for self-signed TLS
+  --frp-transport <protocol> frpc-to-frps transport: tcp, websocket, wss, kcp, or quic
   --remote-port <port>       Public port on server
   --local-ip <ip>            Local service IP. Default: 127.0.0.1
   --local-port <port>        Local service port
@@ -44,7 +46,7 @@ Options:
 
 Example:
   curl -fsSL https://raw.githubusercontent.com/FaQxD233/frpquickstart/main/scripts/install-client.sh \
-    | bash -s -- --share 'frpquick://1.2.3.4:9080/?tls=acme&secret=...' \
+    | bash -s -- --share 'frpquick://1.2.3.4:9080/?tls=acme&transport=tcp&secret=...' \
       --remote-port 18080 --local-port 8080 --service
 EOF
 }
@@ -60,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --secret) SECRET="$2"; shift 2 ;;
     --tls) TLS_MODE="$2"; shift 2 ;;
     --tls-fingerprint) TLS_FINGERPRINT="$2"; shift 2 ;;
+    --frp-transport) FRP_TRANSPORT="$2"; shift 2 ;;
     --remote-port) REMOTE_PORT="$2"; shift 2 ;;
     --local-ip) LOCAL_IP="$2"; shift 2 ;;
     --local-port) LOCAL_PORT="$2"; shift 2 ;;
@@ -136,6 +139,7 @@ else
   [[ -n "$TLS_FINGERPRINT" ]] && cmd+=(--tls-fingerprint "$TLS_FINGERPRINT")
 fi
 cmd+=(--remote-port "$REMOTE_PORT" --local-ip "$LOCAL_IP" --local-port "$LOCAL_PORT" --protocol "$PROTOCOL")
+[[ -n "$FRP_TRANSPORT" ]] && cmd+=(--frp-transport "$FRP_TRANSPORT")
 
 run_script="$INSTALL_DIR/run-$REMOTE_PORT.sh"
 {

@@ -18,6 +18,7 @@ public sealed class TunnelResponse
     public string Message { get; set; } = "";
     public string FrpServerAddress { get; set; } = "";
     public int FrpServerPort { get; set; }
+    public string FrpTransportProtocol { get; set; } = "tcp";
     public string Token { get; set; } = "";
     public int RemotePort { get; set; }
     public string Protocol { get; set; } = "tcp";
@@ -30,6 +31,7 @@ public sealed class HealthResponse
     public string Message { get; set; } = "";
     public string PublicAddress { get; set; } = "";
     public int FrpsBindPort { get; set; }
+    public string FrpTransportProtocol { get; set; } = "tcp";
     public int ControlPort { get; set; }
     public bool FrpsStartedByServer { get; set; }
     /// <summary>

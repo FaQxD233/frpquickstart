@@ -6,6 +6,7 @@ VERSION="${FRPQUICK_VERSION:-latest}"
 INSTALL_DIR="${FRPQUICK_INSTALL_DIR:-/opt/frpquickstart/server}"
 SERVICE_NAME="${FRPQUICK_SERVICE_NAME:-frpquickstart}"
 TLS_MODE="${FRPQUICK_TLS:-acme}"
+FRP_TRANSPORT="${FRPQUICK_FRP_TRANSPORT:-tcp}"
 ACME_ID="${FRPQUICK_ACME_ID:-}"
 ACME_EMAIL="${FRPQUICK_ACME_EMAIL:-}"
 NO_SERVICE=0
@@ -21,6 +22,7 @@ Options:
   --install-dir <path>   Install directory. Default: /opt/frpquickstart/server
   --service-name <name>  systemd service name. Default: frpquickstart
   --tls <mode>           acme, self-signed, or none. Default: acme
+  --frp-transport <p>    frpc-to-frps transport: tcp, websocket, wss, kcp, or quic. Default: tcp
   --acme-id <ip/domain>  ACME identifier. Default: public IPv4 when --tls acme
   --acme-email <email>   ACME account email. Default: admin@<public-ip>.sslip.io
   --no-service           Install binary only, do not create/start systemd service
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --install-dir) INSTALL_DIR="$2"; shift 2 ;;
     --service-name) SERVICE_NAME="$2"; shift 2 ;;
     --tls) TLS_MODE="$2"; shift 2 ;;
+    --frp-transport) FRP_TRANSPORT="$2"; shift 2 ;;
     --acme-id) ACME_ID="$2"; shift 2 ;;
     --acme-email) ACME_EMAIL="$2"; shift 2 ;;
     --no-service) NO_SERVICE=1; shift ;;
@@ -115,7 +118,7 @@ fi
 
 need_cmd systemctl
 
-exec_args="--tls $TLS_MODE"
+exec_args="--tls $TLS_MODE --frp-transport $FRP_TRANSPORT"
 if [[ "$TLS_MODE" == "acme" ]]; then
   exec_args="$exec_args --acme-id $ACME_ID --acme-email $ACME_EMAIL"
 fi

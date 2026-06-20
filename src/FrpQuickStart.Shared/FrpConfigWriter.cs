@@ -12,6 +12,7 @@ public static class FrpConfigWriter
         string serverAddress,
         int serverPort,
         string token,
+        string frpTransportProtocol,
         string proxyName,
         string protocol,
         string localIp,
@@ -27,6 +28,26 @@ public static class FrpConfigWriter
         sb.AppendLine("[auth]");
         sb.AppendLine($"token = {TomlString(token)}");
         sb.AppendLine();
+
+        var transport = NormalizeTransportProtocol(frpTransportProtocol);
+        if (transport != "tcp")
+        {
+            sb.AppendLine("[transport]");
+            if (transport == "wss")
+            {
+                sb.AppendLine("protocol = \"websocket\"");
+                sb.AppendLine();
+                sb.AppendLine("[transport.tls]");
+                sb.AppendLine("enable = true");
+            }
+            else
+            {
+                sb.AppendLine($"protocol = {TomlString(transport)}");
+            }
+
+            sb.AppendLine();
+        }
+
         sb.AppendLine("[[proxies]]");
         sb.AppendLine($"name = {TomlString(proxyName)}");
         sb.AppendLine($"type = {TomlString(protocol)}");
@@ -37,22 +58,80 @@ public static class FrpConfigWriter
         File.WriteAllText(path, sb.ToString(), Utf8NoBom);
     }
 
-    public static void WriteFrpsToml(string path, int bindPort, string token, string logPath)
+    public static void WriteFrpsToml(
+        string path,
+        int bindPort,
+        string token,
+        string logPath,
+        string frpTransportProtocol,
+        string? tlsCertPath,
+        string? tlsKeyPath)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
 
+        var transport = NormalizeTransportProtocol(frpTransportProtocol);
         var sb = new StringBuilder();
         sb.AppendLine($"bindPort = {bindPort.ToString(CultureInfo.InvariantCulture)}");
+        if (transport == "kcp")
+        {
+            sb.AppendLine($"kcpBindPort = {bindPort.ToString(CultureInfo.InvariantCulture)}");
+        }
+        else if (transport == "quic")
+        {
+            sb.AppendLine($"quicBindPort = {bindPort.ToString(CultureInfo.InvariantCulture)}");
+        }
+
         sb.AppendLine();
         sb.AppendLine("[auth]");
         sb.AppendLine($"token = {TomlString(token)}");
         sb.AppendLine();
+        if (transport == "wss")
+        {
+            if (string.IsNullOrWhiteSpace(tlsCertPath) || string.IsNullOrWhiteSpace(tlsKeyPath))
+            {
+                throw new InvalidOperationException("wss 传输需要可供 frps 使用的 TLS 证书和私钥。");
+            }
+
+            sb.AppendLine("[transport.tls]");
+            sb.AppendLine("force = true");
+            sb.AppendLine($"certFile = {TomlString(tlsCertPath)}");
+            sb.AppendLine($"keyFile = {TomlString(tlsKeyPath)}");
+            sb.AppendLine();
+        }
+
         sb.AppendLine("[log]");
         sb.AppendLine($"to = {TomlString(logPath)}");
         sb.AppendLine("level = \"info\"");
         sb.AppendLine("maxDays = 3");
 
         File.WriteAllText(path, sb.ToString(), Utf8NoBom);
+    }
+
+    public static string NormalizeTransportProtocol(string? value)
+    {
+        var normalized = string.IsNullOrWhiteSpace(value)
+            ? "tcp"
+            : value.Trim().ToLowerInvariant();
+
+        return normalized switch
+        {
+            "ws" => "websocket",
+            "tcp" or "kcp" or "quic" or "websocket" or "wss" => normalized,
+            _ => throw new ArgumentException($"不支持的 frp 传输协议: {value}", nameof(value))
+        };
+    }
+
+    public static bool IsSupportedTransportProtocol(string? value)
+    {
+        try
+        {
+            _ = NormalizeTransportProtocol(value);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
